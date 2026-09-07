@@ -21,7 +21,6 @@ use peer_binary_protocol::Piece;
 
 use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker},
-    file_info::FileInfo,
     type_aliases::{FileInfos, FilePriorities, PeerHandle},
 };
 
@@ -279,10 +278,11 @@ impl PieceTracker {
         Some(inflight.started.elapsed())
     }
 
-    /// Mark piece as downloaded after successful hash verification.
-    pub fn mark_piece_hash_ok(&mut self, piece: ValidPieceIndex) {
+    /// Mark piece as downloaded after successful hash verification. Moves the per-file
+    /// counts with it: see [`ChunkTracker::mark_piece_downloaded`].
+    pub fn mark_piece_hash_ok(&mut self, piece: ValidPieceIndex, file_infos: &FileInfos) {
         self.checking.remove(&piece);
-        self.chunks.mark_piece_downloaded(piece);
+        self.chunks.mark_piece_downloaded(piece, file_infos);
     }
 
     /// Mark piece as failed after hash verification failure - requeues the piece.
@@ -348,17 +348,6 @@ impl PieceTracker {
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<crate::chunk_tracker::HaveNeededSelected> {
         self.chunks.update_only_files(file_infos, new_only_files)
-    }
-
-    /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
-    pub fn update_file_have_on_piece_completed(
-        &mut self,
-        piece_id: ValidPieceIndex,
-        file_id: usize,
-        file_info: &FileInfo,
-    ) -> u64 {
-        self.chunks
-            .update_file_have_on_piece_completed(piece_id, file_id, file_info)
     }
 
     /// Flush the have pieces bitfield to disk.
@@ -645,7 +634,7 @@ mod tests {
         assert!(duration.is_some());
         assert!(!tracker.is_inflight(piece));
         // Simulate successful hash check
-        tracker.mark_piece_hash_ok(piece);
+        tracker.mark_piece_hash_ok(piece, &file_infos);
         assert!(tracker.chunks().is_piece_have(piece));
     }
 
@@ -935,7 +924,7 @@ mod tests {
             _ => panic!("Expected Reserved"),
         };
         tracker.take_inflight(piece);
-        tracker.mark_piece_hash_ok(piece);
+        tracker.mark_piece_hash_ok(piece, &file_infos);
 
         let chunks = tracker.into_chunks();
         assert!(chunks.is_piece_have(piece));
