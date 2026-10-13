@@ -269,6 +269,22 @@ impl Drop for TransactionIdGuard<'_> {
     }
 }
 
+/// Bind the dual-stack wildcard `[::]:0`; if that fails (kernel without IPv6,
+/// `ipv6.disable=1`: EAFNOSUPPORT), fall back to `0.0.0.0:0` instead of
+/// failing the whole session. Dual-stack hosts are unaffected.
+fn bind_with_ipv4_fallback<T>(
+    mut bind: impl FnMut(SocketAddr) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    match bind(v6) {
+        Ok(sock) => Ok(sock),
+        Err(e) => {
+            warn!("{e:#}; falling back to IPv4-only UDP tracker socket");
+            bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        }
+    }
+}
+
 impl UdpTrackerClient {
     /// `bind_ip`: the address to send from (None: every address, dual-stack). A session that
     /// listens on one address only, or uses no trackers, needs no socket on every address.
@@ -289,15 +305,21 @@ impl UdpTrackerClient {
         bind_ip: Option<IpAddr>,
         filter: Option<UdpTrackerAddrFilter>,
     ) -> anyhow::Result<Self> {
-        let addr = SocketAddr::new(bind_ip.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), 0);
-        let sock = UdpSocket::bind_udp(
-            addr,
-            librqbit_dualstack_sockets::BindOpts {
-                device: bind_device,
-                ..Default::default()
-            },
-        )
-        .with_context(|| format!("error creating UDP socket at {addr}"))?;
+        // A chosen address is used as it is; only the wildcard falls back to IPv4.
+        let bind = |addr: SocketAddr| {
+            UdpSocket::bind_udp(
+                addr,
+                librqbit_dualstack_sockets::BindOpts {
+                    device: bind_device,
+                    ..Default::default()
+                },
+            )
+            .with_context(|| format!("error creating UDP socket at {addr}"))
+        };
+        let sock = match bind_ip {
+            Some(ip) => bind(SocketAddr::new(ip, 0))?,
+            None => bind_with_ipv4_fallback(bind)?,
+        };
 
         let client = Self {
             state: Arc::new(ClientShared {
@@ -495,6 +517,34 @@ mod tests {
             tracker.recv_from(&mut buf).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn test_bind_falls_back_to_ipv4_without_ipv6() {
+        let mut tried = Vec::new();
+        let got = super::bind_with_ipv4_fallback(|addr| {
+            tried.push(addr);
+            if addr.is_ipv6() {
+                anyhow::bail!("Address family not supported by protocol (os error 97)")
+            }
+            Ok(addr)
+        })
+        .unwrap();
+        assert!(got.is_ipv4() && got.ip().is_unspecified());
+        assert_eq!(tried.len(), 2);
+        // Dual-stack: the IPv6 wildcard is used, no second bind.
+        let got = super::bind_with_ipv4_fallback(Ok).unwrap();
+        assert!(got.is_ipv6() && got.ip().is_unspecified());
+        // Real socket: must succeed on IPv4-only and dual-stack hosts.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            super::UdpTrackerClient::new(Default::default(), None, None)
+                .await
+                .unwrap();
+        });
     }
 
     #[test]
