@@ -213,7 +213,7 @@ pub struct TorrentStateLive {
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
-    ratelimits: Limits,
+    ratelimits: Arc<Limits>,
 }
 
 impl TorrentStateLive {
@@ -263,7 +263,7 @@ impl TorrentStateLive {
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
+        let ratelimits = paused.shared.ratelimits.clone();
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),

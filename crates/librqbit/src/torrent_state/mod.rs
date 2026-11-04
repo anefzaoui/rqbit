@@ -195,6 +195,10 @@ pub struct ManagedTorrentShared {
     pub(crate) magnet_name: Option<String>,
 
     pub(crate) client_name_and_version: String,
+
+    /// This torrent's own rate limits, kept across pauses and changeable while it runs
+    /// (`ManagedTorrent::set_ratelimits`).
+    pub(crate) ratelimits: Arc<crate::limits::Limits>,
 }
 
 impl ManagedTorrentShared {
@@ -248,6 +252,17 @@ impl ManagedTorrent {
 
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
+    }
+
+    /// This torrent's own download and upload limits (each on top of the session's).
+    pub fn ratelimits(&self) -> crate::limits::LimitsConfig {
+        self.shared.ratelimits.get_config()
+    }
+
+    /// Change this torrent's own limits while it runs, paused or not; they last until changed.
+    pub fn set_ratelimits(&self, config: crate::limits::LimitsConfig) {
+        self.shared.ratelimits.set_download_bps(config.download_bps);
+        self.shared.ratelimits.set_upload_bps(config.upload_bps);
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

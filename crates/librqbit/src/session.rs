@@ -1352,6 +1352,7 @@ impl Session {
             let peer_opts = self.merge_peer_opts(opts.peer_opts);
             let metadata = Arc::new(metadata);
             let minfo = Arc::new(ManagedTorrentShared {
+                ratelimits: Arc::new(crate::limits::Limits::new(opts.ratelimits)),
                 id,
                 span,
                 info_hash,
