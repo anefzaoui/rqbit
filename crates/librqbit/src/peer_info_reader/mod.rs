@@ -23,6 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::trace;
 
 use crate::{
+    dht_utils::MetadataProgress,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -38,6 +39,7 @@ pub(crate) async fn read_metainfo_from_peer(
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    progress: Option<Arc<MetadataProgress>>,
 ) -> anyhow::Result<TorrentAndInfoBytes> {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
         Result<(TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned), bencode::DeserializeError>,
@@ -50,6 +52,7 @@ pub(crate) async fn read_metainfo_from_peer(
         result_tx: Mutex::new(Some(result_tx)),
         locked: RwLock::new(None),
         client_name_and_version,
+        progress,
     };
     let connection = PeerConnection::new(
         addr,
@@ -160,6 +163,7 @@ struct Handler {
     >,
     locked: RwLock<Option<HandlerLocked>>,
     client_name_and_version: String,
+    progress: Option<Arc<MetadataProgress>>,
 }
 
 impl PeerConnectionHandler for Handler {
@@ -172,6 +176,9 @@ impl PeerConnectionHandler for Handler {
     }
 
     fn on_handshake(&self, handshake: Handshake, _kind: ConnectionKind) -> anyhow::Result<()> {
+        if let Some(p) = &self.progress {
+            MetadataProgress::add(&p.connected);
+        }
         if !handshake.supports_extended() {
             anyhow::bail!(
                 "this peer does not support extended handshaking, which is a prerequisite to download metadata"

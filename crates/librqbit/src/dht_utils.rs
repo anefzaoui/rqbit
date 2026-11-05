@@ -1,4 +1,11 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use anyhow::Context;
 use buffers::ByteBufOwned;
@@ -11,6 +18,31 @@ use crate::{
     stream_connect::StreamConnector,
 };
 use librqbit_core::hash_id::Id20;
+
+/// How a magnet's metadata lookup is going (`AddTorrentOptions::metadata_progress`), for a client
+/// that shows the wait: where peers came from, how many were asked, and how many answered. Every
+/// count only grows.
+#[derive(Debug, Default)]
+pub struct MetadataProgress {
+    /// Peer addresses the DHT gave (repeats included).
+    pub from_dht: AtomicUsize,
+    /// Peer addresses the trackers gave (repeats included).
+    pub from_trackers: AtomicUsize,
+    /// Peer addresses local service discovery gave (repeats included).
+    pub from_lsd: AtomicUsize,
+    /// Different peers asked for the metadata (the initial peers included).
+    pub peers: AtomicUsize,
+    /// Peers that answered the BitTorrent handshake.
+    pub connected: AtomicUsize,
+    /// Peers given up on: unreachable, closed the connection, or had no metadata to give.
+    pub failed: AtomicUsize,
+}
+
+impl MetadataProgress {
+    pub(crate) fn add(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -35,6 +67,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    progress: Option<Arc<MetadataProgress>>,
 ) -> ReadMetainfoResult<A> {
     let mut seen = HashSet::<SocketAddr>::new();
     let mut addrs = addrs_stream;
@@ -45,7 +78,11 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
         let semaphore = &semaphore;
         let connector = connector.clone();
         let client_name_and_version = client_name_and_version.clone();
+        let progress = progress.clone();
         async move {
+            if let Some(p) = &progress {
+                MetadataProgress::add(&p.peers);
+            }
             let token = semaphore.acquire().await?;
             let ret = peer_info_reader::read_metainfo_from_peer(
                 addr,
@@ -57,11 +94,15 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                 BlockingSpawner::new(1),
                 connector,
                 client_name_and_version,
+                progress.clone(),
             )
             .instrument(debug_span!("read_metainfo_from_peer", ?addr))
             .await
             .with_context(|| format!("error reading metainfo from {addr}"));
             drop(token);
+            if let (Err(_), Some(p)) = (&ret, &progress) {
+                MetadataProgress::add(&p.failed);
+            }
             ret
         }
     };
@@ -146,6 +187,7 @@ mod tests {
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
             crate::client_name_and_version().to_owned(),
+            None,
         )
         .await
         {

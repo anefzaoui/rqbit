@@ -18,7 +18,7 @@ use crate::{
     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
     create_torrent,
     create_torrent_file::CreateTorrentResult,
-    dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    dht_utils::{MetadataProgress, ReadMetainfoResult, read_metainfo_from_peer_receiver},
     ip_ranges::IpRanges,
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
@@ -298,6 +298,11 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// A magnet's metadata lookup counts here as it goes (peers found per source, asked,
+    /// connected), for a client that shows the wait.
+    #[serde(skip)]
+    pub metadata_progress: Option<Arc<MetadataProgress>>,
 }
 
 pub struct ListOnlyResponse {
@@ -614,6 +619,14 @@ impl Session {
                         .then_some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
             });
 
+            // The DHT listens on the listener's address too when that is a single one (a
+            // loopback-only test session): no socket on every address that nothing needs.
+            let dht_listen_ip = opts
+                .listen
+                .as_ref()
+                .map(|l| l.listen_addr.ip())
+                .filter(|ip| !ip.is_unspecified());
+
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
                     listen_opts
@@ -633,6 +646,7 @@ impl Session {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create(
                         persistence_config,
+                        dht_listen_ip,
                         dht_config.port,
                         opts.ipv4_only,
                         dht_config.bootstrap_addrs,
@@ -642,7 +656,10 @@ impl Session {
                     .await
                     .context("error initializing persistent DHT")?
                 } else {
-                    let listen_addr = dht_listen_addr(dht_config.port, None, opts.ipv4_only);
+                    let mut listen_addr = dht_listen_addr(dht_config.port, None, opts.ipv4_only);
+                    if let Some(ip) = dht_listen_ip {
+                        listen_addr.set_ip(ip);
+                    }
                     DhtBuilder::with_config(DhtConfig {
                         bootstrap_addrs: dht_config.bootstrap_addrs,
                         cancellation_token: Some(token.child_token()),
@@ -1270,6 +1287,7 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                opts.metadata_progress.clone(),
             )
         };
 
@@ -1289,7 +1307,13 @@ impl Session {
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts)
+                        .resolve_magnet(
+                            info_hash,
+                            peer_rx,
+                            &trackers,
+                            opts.peer_opts,
+                            opts.metadata_progress.clone(),
+                        )
                         .await?;
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
@@ -1556,6 +1580,7 @@ impl Session {
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+            None,
         )
     }
 
@@ -1568,22 +1593,37 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        progress: Option<Arc<MetadataProgress>>,
     ) -> Option<PeerStream> {
+        // Each source's peers counted as they come, for a magnet's lookup that is watched.
+        let counted = |stream: Option<BoxStream<'static, SocketAddr>>, pick: fn(&MetadataProgress) -> &std::sync::atomic::AtomicUsize| {
+            let progress = progress.clone();
+            stream.map(|s| match progress {
+                Some(p) => s
+                    .inspect(move |_| MetadataProgress::add(pick(&p)))
+                    .boxed(),
+                None => s,
+            })
+        };
         let dht_rx = if is_private {
             None
         } else {
             self.dht.as_ref().map(|dht| {
                 dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                    .boxed()
             })
         };
+        let dht_rx = counted(dht_rx, |p| &p.from_dht);
 
         let lsd_rx = if is_private {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
                 lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                    .boxed()
             })
         };
+        let lsd_rx = counted(lsd_rx, |p| &p.from_lsd);
 
         if self.disable_trackers {
             trackers.clear();
@@ -1613,6 +1653,7 @@ impl Session {
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
         );
+        let tracker_rx = counted(tracker_rx, |p| &p.from_trackers);
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -1673,6 +1714,7 @@ impl Session {
         peer_rx: PeerStream,
         trackers: &[url::Url],
         peer_opts: Option<PeerConnectionOptions>,
+        progress: Option<Arc<MetadataProgress>>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
             self.peer_id,
@@ -1682,6 +1724,7 @@ impl Session {
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             self.client_name_and_version.clone(),
+            progress,
         )
         .await
         {

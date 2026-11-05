@@ -101,8 +101,10 @@ impl PersistentDht {
     }
 
     #[inline(never)]
+    /// `listen_ip`: the address to listen on (None: every address, see `dht_listen_addr`).
     pub fn create<'a>(
         persistence_config: DhtPersistenceConfig,
+        listen_ip: Option<IpAddr>,
         port: Option<u16>,
         ipv4_only: bool,
         bootstrap_addrs: Option<Vec<String>>,
@@ -157,7 +159,10 @@ impl PersistentDht {
                 .map(|de| (Some(de.addr.port()), Some(de.table), de.peer_store))
                 .unwrap_or((None, None, None));
 
-            let listen_addr = dht_listen_addr(port, stored_port, ipv4_only);
+            let mut listen_addr = dht_listen_addr(port, stored_port, ipv4_only);
+            if let Some(ip) = listen_ip {
+                listen_addr.set_ip(ip);
+            }
             let peer_id = routing_table.as_ref().map(|r| r.id());
 
             let dht_config = DhtConfig {
