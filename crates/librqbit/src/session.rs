@@ -595,6 +595,18 @@ impl Session {
                 None => None,
             };
 
+            // The UDP tracker client sends from the listener's address when that is a single
+            // one (a loopback-only test session), and from loopback when trackers are off: no
+            // socket on every address that nothing needs (Windows Firewall asks about those).
+            let udp_tracker_bind_ip = opts
+                .listen
+                .as_ref()
+                .map(|l| l.listen_addr.ip())
+                .filter(|ip| !ip.is_unspecified())
+                .or(opts
+                    .disable_trackers
+                    .then_some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
                     listen_opts
@@ -765,9 +777,10 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                .await
-                .context("error creating UDP tracker client")?;
+            let udp_tracker_client =
+                UdpTrackerClient::new(token.clone(), bind_device.as_ref(), udp_tracker_bind_ip)
+                    .await
+                    .context("error creating UDP tracker client")?;
 
             let lsd = {
                 if opts.disable_local_service_discovery {

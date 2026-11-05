@@ -265,11 +265,14 @@ impl Drop for TransactionIdGuard<'_> {
 }
 
 impl UdpTrackerClient {
+    /// `bind_ip`: the address to send from (None: every address, dual-stack). A session that
+    /// listens on one address only, or uses no trackers, needs no socket on every address.
     pub async fn new(
         cancel_token: CancellationToken,
         bind_device: Option<&BindDevice>,
+        bind_ip: Option<IpAddr>,
     ) -> anyhow::Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let addr = SocketAddr::new(bind_ip.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), 0);
         let sock = UdpSocket::bind_udp(
             addr,
             librqbit_dualstack_sockets::BindOpts {
