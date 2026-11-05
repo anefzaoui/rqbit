@@ -1596,15 +1596,15 @@ impl Session {
         progress: Option<Arc<MetadataProgress>>,
     ) -> Option<PeerStream> {
         // Each source's peers counted as they come, for a magnet's lookup that is watched.
-        let counted = |stream: Option<BoxStream<'static, SocketAddr>>, pick: fn(&MetadataProgress) -> &std::sync::atomic::AtomicUsize| {
-            let progress = progress.clone();
-            stream.map(|s| match progress {
-                Some(p) => s
-                    .inspect(move |_| MetadataProgress::add(pick(&p)))
-                    .boxed(),
-                None => s,
-            })
-        };
+        let counted =
+            |stream: Option<BoxStream<'static, SocketAddr>>,
+             pick: fn(&MetadataProgress) -> &std::sync::atomic::AtomicUsize| {
+                let progress = progress.clone();
+                stream.map(|s| match progress {
+                    Some(p) => s.inspect(move |_| MetadataProgress::add(pick(&p))).boxed(),
+                    None => s,
+                })
+            };
         let dht_rx = if is_private {
             None
         } else {
