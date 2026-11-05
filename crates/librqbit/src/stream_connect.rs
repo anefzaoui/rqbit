@@ -102,17 +102,30 @@ impl SocksProxyConfig {
     )> {
         let proxy_addr = (self.host.as_str(), self.port);
 
-        // Bound: the connection to the proxy leaves from the bound address too.
-        if let Some(ip) = bind_ip {
-            let proxy = tokio::net::lookup_host(proxy_addr)
-                .await?
-                .find(|a| a.is_ipv4() == ip.is_ipv4())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        "the proxy has no address of the bound address's family",
-                    )
-                })?;
+        // Bound: the connection to the proxy leaves from the bound address too, unless the
+        // proxy is on this computer (that connection doesn't leave it, and Windows refuses a
+        // connection to loopback from another address).
+        let bound = match bind_ip {
+            Some(ip) => {
+                let all: Vec<SocketAddr> = tokio::net::lookup_host(proxy_addr).await?.collect();
+                if !ip.is_loopback() && all.iter().all(|a| a.ip().is_loopback()) {
+                    None
+                } else {
+                    let proxy = all
+                        .into_iter()
+                        .find(|a| a.is_ipv4() == ip.is_ipv4())
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::AddrNotAvailable,
+                                "the proxy has no address of the bound address's family",
+                            )
+                        })?;
+                    Some((ip, proxy))
+                }
+            }
+            None => None,
+        };
+        if let Some((ip, proxy)) = bound {
             let socket = bound_tcp_connect(ip, proxy).await?;
             let stream = if let Some((username, password)) = self.username_password.as_ref() {
                 tokio_socks::tcp::Socks5Stream::connect_with_password_and_socket(

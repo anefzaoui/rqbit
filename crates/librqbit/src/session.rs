@@ -779,8 +779,19 @@ impl Session {
                     }
                     b
                 };
-                // HTTP trackers (and the proxy's connection) from the bound address too.
-                if let Some(ip) = opts.bind_ip {
+                // HTTP trackers (and the proxy's connection) from the bound address too; not to
+                // a proxy on this computer (Windows refuses a connection to loopback from
+                // another address, and that one doesn't leave the computer).
+                let local_proxy = proxy_config.as_ref().is_some_and(|p| {
+                    p.host.eq_ignore_ascii_case("localhost")
+                        || p.host
+                            .trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                });
+                if let Some(ip) = opts.bind_ip
+                    && !(local_proxy && !ip.is_loopback())
+                {
                     builder = builder.local_address(ip);
                 }
 
