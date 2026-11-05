@@ -434,6 +434,11 @@ pub struct SessionOptions {
     /// Disable tracker communication
     pub disable_trackers: bool,
 
+    /// The address the UDP tracker client sends from. None: the listener's address when it is
+    /// a single one, loopback when trackers are disabled, else every address (dual-stack).
+    /// A client whose UDP trackers must not be used (behind a proxy) sets loopback.
+    pub udp_tracker_bind_ip: Option<std::net::IpAddr>,
+
     /// Enable fastresume, to restore state quickly after restart.
     pub fastresume: bool,
 
@@ -494,6 +499,7 @@ impl Default for SessionOptions {
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
             disable_trackers: false,
+            udp_tracker_bind_ip: None,
             fastresume: false,
             persistence: None,
             peer_id: None,
@@ -598,14 +604,15 @@ impl Session {
             // The UDP tracker client sends from the listener's address when that is a single
             // one (a loopback-only test session), and from loopback when trackers are off: no
             // socket on every address that nothing needs (Windows Firewall asks about those).
-            let udp_tracker_bind_ip = opts
-                .listen
-                .as_ref()
-                .map(|l| l.listen_addr.ip())
-                .filter(|ip| !ip.is_unspecified())
-                .or(opts
-                    .disable_trackers
-                    .then_some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+            let udp_tracker_bind_ip = opts.udp_tracker_bind_ip.or_else(|| {
+                opts.listen
+                    .as_ref()
+                    .map(|l| l.listen_addr.ip())
+                    .filter(|ip| !ip.is_unspecified())
+                    .or(opts
+                        .disable_trackers
+                        .then_some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+            });
 
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
