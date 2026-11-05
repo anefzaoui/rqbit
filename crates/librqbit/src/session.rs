@@ -436,6 +436,14 @@ pub struct SessionOptions {
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     pub bind_device_name: Option<String>,
 
+    /// The local address every socket binds to: the TCP/uTP listeners (when listening on every
+    /// address), the DHT, the UDP tracker client, outgoing peer connections (TCP, and through a
+    /// SOCKS proxy) and the HTTP client (trackers). For systems that route by source address
+    /// (Windows' strong host model), where it holds the session to one network adapter: when
+    /// the address is gone, nothing can be sent at all. Its IP family only: set `ipv4_only` with
+    /// an IPv4 address.
+    pub bind_ip: Option<std::net::IpAddr>,
+
     /// Disable tracker communication
     pub disable_trackers: bool,
 
@@ -503,6 +511,7 @@ impl Default for SessionOptions {
         Self {
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
+            bind_ip: None,
             disable_trackers: false,
             udp_tracker_bind_ip: None,
             fastresume: false,
@@ -606,10 +615,18 @@ impl Session {
                 None => None,
             };
 
-            // The UDP tracker client sends from the listener's address when that is a single
-            // one (a loopback-only test session), and from loopback when trackers are off: no
-            // socket on every address that nothing needs (Windows Firewall asks about those).
-            let udp_tracker_bind_ip = opts.udp_tracker_bind_ip.or_else(|| {
+            // A bound session listens on its address, not on every one.
+            if let (Some(ip), Some(listen)) = (opts.bind_ip, opts.listen.as_mut())
+                && listen.listen_addr.ip().is_unspecified()
+            {
+                listen.listen_addr.set_ip(ip);
+            }
+
+            // The UDP tracker client sends from the bound address, else from the listener's
+            // address when that is a single one (a loopback-only test session), and from
+            // loopback when trackers are off: no socket on every address that nothing needs
+            // (Windows Firewall asks about those).
+            let udp_tracker_bind_ip = opts.udp_tracker_bind_ip.or(opts.bind_ip).or_else(|| {
                 opts.listen
                     .as_ref()
                     .map(|l| l.listen_addr.ip())
@@ -621,11 +638,13 @@ impl Session {
 
             // The DHT listens on the listener's address too when that is a single one (a
             // loopback-only test session): no socket on every address that nothing needs.
+            // A bound session's DHT: on the bound address.
             let dht_listen_ip = opts
                 .listen
                 .as_ref()
                 .map(|l| l.listen_addr.ip())
-                .filter(|ip| !ip.is_unspecified());
+                .filter(|ip| !ip.is_unspecified())
+                .or(opts.bind_ip);
 
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
@@ -747,7 +766,7 @@ impl Session {
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
             let reqwest_client = {
-                let builder = if let Some(proxy_url) = proxy_url {
+                let mut builder = if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
                     reqwest::Client::builder().proxy(proxy)
@@ -760,6 +779,10 @@ impl Session {
                     }
                     b
                 };
+                // HTTP trackers (and the proxy's connection) from the bound address too.
+                if let Some(ip) = opts.bind_ip {
+                    builder = builder.local_address(ip);
+                }
 
                 builder
                     .user_agent(&client_name_and_version)
@@ -773,6 +796,7 @@ impl Session {
                     socks_proxy_config: proxy_config,
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
+                    bind_ip: opts.bind_ip,
                     ipv4_only: opts.ipv4_only,
                 })
                 .await

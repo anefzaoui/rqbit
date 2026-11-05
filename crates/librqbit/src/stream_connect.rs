@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 use librqbit_dualstack_sockets::ConnectOpts;
@@ -64,6 +68,7 @@ pub(crate) struct StreamConnectorArgs {
     pub socks_proxy_config: Option<SocksProxyConfig>,
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
     pub bind_device: Option<BindDevice>,
+    pub bind_ip: Option<IpAddr>,
     pub ipv4_only: bool,
 }
 
@@ -90,11 +95,38 @@ impl SocksProxyConfig {
     async fn connect(
         &self,
         addr: SocketAddr,
+        bind_ip: Option<IpAddr>,
     ) -> tokio_socks::Result<(
         impl tokio::io::AsyncRead + Unpin + 'static,
         impl tokio::io::AsyncWrite + Unpin + 'static,
     )> {
         let proxy_addr = (self.host.as_str(), self.port);
+
+        // Bound: the connection to the proxy leaves from the bound address too.
+        if let Some(ip) = bind_ip {
+            let proxy = tokio::net::lookup_host(proxy_addr)
+                .await?
+                .find(|a| a.is_ipv4() == ip.is_ipv4())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "the proxy has no address of the bound address's family",
+                    )
+                })?;
+            let socket = bound_tcp_connect(ip, proxy).await?;
+            let stream = if let Some((username, password)) = self.username_password.as_ref() {
+                tokio_socks::tcp::Socks5Stream::connect_with_password_and_socket(
+                    socket,
+                    addr,
+                    username.as_str(),
+                    password.as_str(),
+                )
+                .await?
+            } else {
+                tokio_socks::tcp::Socks5Stream::connect_with_socket(socket, addr).await?
+            };
+            return Ok(tokio::io::split(stream));
+        }
 
         let stream = if let Some((username, password)) = self.username_password.as_ref() {
             tokio_socks::tcp::Socks5Stream::connect_with_password(
@@ -110,6 +142,27 @@ impl SocksProxyConfig {
 
         Ok(tokio::io::split(stream))
     }
+}
+
+/// A TCP connection from `local` (port chosen by the system) to `addr`: it leaves through the
+/// interface that has `local`, or fails (another family, or the address is gone).
+async fn bound_tcp_connect(
+    local: IpAddr,
+    addr: SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    if local.is_ipv4() != addr.is_ipv4() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("{addr} can't be reached from the bound address {local} (another IP family)"),
+        ));
+    }
+    let socket = if local.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.bind(SocketAddr::new(local, 0))?;
+    socket.connect(addr).await
 }
 
 gen_stats!(SingleStatAtomic SingleStatSnapshot, [
@@ -132,6 +185,7 @@ pub(crate) struct StreamConnector {
     proxy_config: Option<SocksProxyConfig>,
     enable_tcp: bool,
     bind_device: Option<BindDevice>,
+    bind_ip: Option<IpAddr>,
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
@@ -158,6 +212,7 @@ impl StreamConnector {
             enable_tcp: config.enable_tcp,
             utp_socket: config.utp_socket,
             bind_device: config.bind_device,
+            bind_ip: config.bind_ip,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
         })
@@ -189,6 +244,16 @@ impl StreamConnector {
         &self,
         addr: SocketAddr,
     ) -> librqbit_dualstack_sockets::Result<tokio::net::TcpStream> {
+        // Bound to an address: from it, or not at all.
+        if let Some(ip) = self.bind_ip {
+            return self
+                .with_stat(ConnectionKind::Tcp, addr.is_ipv6(), async {
+                    bound_tcp_connect(ip, addr)
+                        .await
+                        .map_err(librqbit_dualstack_sockets::Error::Connect)
+                })
+                .await;
+        }
         self.with_stat(
             ConnectionKind::Tcp,
             addr.is_ipv6(),
@@ -229,7 +294,11 @@ impl StreamConnector {
 
         if let Some(proxy) = self.proxy_config.as_ref() {
             let (r, w) = self
-                .with_stat(ConnectionKind::Socks, addr.is_ipv6(), proxy.connect(addr))
+                .with_stat(
+                    ConnectionKind::Socks,
+                    addr.is_ipv6(),
+                    proxy.connect(addr, self.bind_ip),
+                )
                 .await?;
             debug!(?addr, "connected through SOCKS5");
             return Ok((
