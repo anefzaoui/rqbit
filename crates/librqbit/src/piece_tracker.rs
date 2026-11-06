@@ -71,6 +71,9 @@ where
     /// How many peers have each piece, and this torrent's seed for ties (rarest-first).
     pub availability: Option<&'a crate::piece_order::PieceAvailability>,
     pub seed: u64,
+    /// In order: how many of the next pieces this peer leaves to faster peers (a slow peer
+    /// holding the next piece would hold up the whole file's start).
+    pub skip: usize,
 }
 
 /// Coordinates piece download state.
@@ -171,7 +174,21 @@ impl PieceTracker {
                         crate::piece_order::tie_break(*p, req.seed),
                     )
                 }),
-            _ => queued.into_iter().find(|p| (req.peer_has_piece)(*p)),
+            _ => {
+                let mut have = queued.into_iter().filter(|p| (req.peer_has_piece)(*p));
+                // The `skip`-th it has, else the last one (near the end, nothing is left to
+                // skip to).
+                let mut last = None;
+                let mut picked = None;
+                for (i, p) in have.by_ref().enumerate() {
+                    last = Some(p);
+                    if i == req.skip {
+                        picked = Some(p);
+                        break;
+                    }
+                }
+                picked.or(last)
+            }
         };
         if let Some(piece) = chosen {
             return self.reserve_piece(piece, req.peer);
@@ -421,6 +438,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         // Should reserve piece 0 (first in queue)
@@ -457,6 +475,7 @@ mod tests {
                     order,
                     availability,
                     seed: 7,
+                    skip: 0,
                 }) {
                     AcquireResult::Reserved(p) => Some(p.get()),
                     _ => None,
@@ -480,6 +499,35 @@ mod tests {
             taken(&mut t, order(false), None, |_| true, 5),
             [0, 1, 2, 3, 4]
         );
+    }
+
+    #[test]
+    fn a_slow_peer_in_order_starts_further_on() {
+        let strict = crate::PieceOrder::InOrder {
+            first_and_last_first: false,
+        };
+        for (skip, want) in [(0, 0), (2, 2), (10, 4)] {
+            let mut t = PieceTracker::new(make_test_chunk_tracker(5));
+            let file_infos = make_test_file_infos(5);
+            let file_priorities = make_default_file_priorities(&file_infos);
+            let got = t.acquire_piece(AcquireRequest {
+                peer: peer(1),
+                peer_avg_time: None,
+                priority_pieces: std::iter::empty(),
+                file_priorities: &file_priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+                order: strict,
+                availability: None,
+                seed: 0,
+                skip,
+            });
+            match got {
+                AcquireResult::Reserved(p) => assert_eq!(p.get(), want, "skip {skip}"),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -539,6 +587,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         match result {
@@ -570,6 +619,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         let piece = match result {
@@ -606,6 +656,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         let piece = match result {
@@ -637,6 +688,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         match result2 {
@@ -669,6 +721,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -684,6 +737,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -701,6 +755,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -743,6 +798,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
@@ -755,6 +811,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         assert_eq!(tracker.inflight_count(), 2);
@@ -775,6 +832,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         // Should get piece 0 again (was requeued)
@@ -816,6 +874,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         // Should get piece 3 (first priority piece)
@@ -845,6 +904,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         match result {
@@ -896,6 +956,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 0);
@@ -915,6 +976,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 4);
@@ -940,6 +1002,7 @@ mod tests {
             order: Default::default(),
             availability: None,
             seed: 0,
+            skip: 0,
         });
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)

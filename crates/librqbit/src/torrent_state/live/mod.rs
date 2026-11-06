@@ -1435,6 +1435,26 @@ impl PeerHandler {
         // Steal info to process after releasing the peer lock
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
 
+        // In order, a peer much slower than the fastest one starts further on, one piece ahead
+        // per multiple of the fastest's piece time: the file's start doesn't wait on it, and
+        // its pieces aren't taken from it (the time it spent on them lost). Worked out before
+        // this peer's entry is locked: the other peers are read.
+        let order = *self.state.shared.piece_order.read();
+        let skip = match (order, self.counters.average_piece_download_time()) {
+            (crate::PieceOrder::InOrder { .. }, Some(mine)) => self
+                .state
+                .peers
+                .states
+                .iter()
+                .filter(|p| p.value().get_live().is_some())
+                .filter_map(|p| p.value().stats.counters.average_piece_download_time())
+                .filter(|t| !t.is_zero())
+                .min()
+                .map_or(0, |fastest| {
+                    ((mine.as_secs_f64() / fastest.as_secs_f64()) as usize).saturating_sub(1)
+                }),
+            _ => 0,
+        };
         let result = self
             .state
             .peers
@@ -1461,9 +1481,10 @@ impl PeerHandler {
                             .try_write()
                             .is_some()
                     },
-                    order: *self.state.shared.piece_order.read(),
+                    order,
                     availability: Some(&self.state.peers.availability),
                     seed: self.state.shared.piece_order_seed,
+                    skip,
                 });
 
                 match result {
