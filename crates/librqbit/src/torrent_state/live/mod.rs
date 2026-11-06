@@ -118,6 +118,14 @@ use super::{
     utils::{TimedExistence, timeit},
 };
 
+/// A chunk as a peer's request names it: piece and offset.
+pub(crate) fn chunk_key(ci: &ChunkInfo) -> (u32, u32) {
+    (ci.piece_index.get(), ci.offset)
+}
+
+/// The most cancelled requests remembered per peer (a peer has far fewer outstanding).
+const MAX_CANCELLED_UPLOADS: usize = 4096;
+
 fn make_piece_bitfield(lengths: &Lengths) -> BF {
     BF::from_boxed_slice(vec![0; lengths.piece_bitfield_bytes()].into_boxed_slice())
 }
@@ -210,6 +218,7 @@ pub struct TorrentStateLive {
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
+        PeerHandle,
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
@@ -260,6 +269,7 @@ impl TorrentStateLive {
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            PeerHandle,
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
@@ -446,11 +456,17 @@ impl TorrentStateLive {
     async fn task_upload_scheduler(
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<(
+            PeerHandle,
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>,
     ) -> crate::Result<()> {
-        while let Some((tx, ci)) = rx.recv().await {
+        while let Some((addr, tx, ci)) = rx.recv().await {
+            // A chunk the peer cancelled (it got it elsewhere) is neither waited for nor sent:
+            // the upload budget goes to what is still wanted.
+            if self.peers.take_cancelled_upload(addr, &ci) {
+                continue;
+            }
             tokio::select! {
                 _ = tx.closed() => {
                     continue;
@@ -468,6 +484,9 @@ impl TorrentStateLive {
                         res?;
                     }
                 }
+            }
+            if self.peers.take_cancelled_upload(addr, &ci) {
+                continue;
             }
             let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
         }
@@ -1092,9 +1111,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::NotInterested => {
                 trace!("received \"not interested\", but we don't process it yet")
             }
-            Message::Cancel(_) => {
-                trace!("received \"cancel\", but we don't process it yet")
-            }
+            Message::Cancel(request) => self.on_cancel(request),
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
             ))) => {
@@ -1553,10 +1570,39 @@ impl PeerHandler {
             );
         }
 
+        // Asked for again after a cancel: wanted after all.
+        self.state
+            .peers
+            .with_live_mut(self.addr, "on_download_request", |live| {
+                live.cancelled_uploads.remove(&chunk_key(&chunk_info));
+            });
         self.state
             .ratelimit_upload_tx
-            .send((self.tx.clone(), chunk_info))?;
+            .send((self.addr, self.tx.clone(), chunk_info))?;
         Ok(())
+    }
+
+    /// The peer no longer wants a chunk it asked for: noted, so the upload scheduler drops it
+    /// if it hasn't been sent yet.
+    fn on_cancel(&self, request: Request) {
+        let Some(piece) = self.state.lengths.validate_piece_index(request.index) else {
+            return;
+        };
+        let Some(ci) =
+            self.state
+                .lengths
+                .chunk_info_from_received_data(piece, request.begin, request.length)
+        else {
+            return;
+        };
+        self.state
+            .peers
+            .with_live_mut(self.addr, "on_cancel", |live| {
+                // Bounded: a peer can't make it grow without end.
+                if live.cancelled_uploads.len() < MAX_CANCELLED_UPLOADS {
+                    live.cancelled_uploads.insert(chunk_key(&ci));
+                }
+            });
     }
 
     fn on_have(&self, have: u32) {

@@ -276,6 +276,10 @@ pub(crate) struct LivePeerState {
     // When the peer sends us data this is used to track if we asked for it.
     inflight_requests: HashSet<InflightRequest>,
 
+    // Chunks the peer asked for and then cancelled (piece, offset), not yet dropped from the
+    // upload queue (`TorrentStateLive::task_upload_scheduler`).
+    pub cancelled_uploads: HashSet<(u32, u32)>,
+
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
     // canceled chunk, so a peer is not disconnected for racing our cancel messages.
@@ -303,6 +307,7 @@ impl LivePeerState {
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
+            cancelled_uploads: Default::default(),
             late_cancelled_request_tolerance: 0,
             request_slots_changed: Default::default(),
             tx,

@@ -110,6 +110,19 @@ impl PeerStates {
         .unwrap_or(false)
     }
 
+    /// Whether the peer cancelled this chunk (forgotten once asked).
+    pub fn take_cancelled_upload(
+        &self,
+        handle: PeerHandle,
+        ci: &librqbit_core::lengths::ChunkInfo,
+    ) -> bool {
+        self.with_live_mut(handle, "take_cancelled_upload", |live| {
+            !live.cancelled_uploads.is_empty()
+                && live.cancelled_uploads.remove(&super::chunk_key(ci))
+        })
+        .unwrap_or(false)
+    }
+
     pub fn mark_peer_interested(&self, handle: PeerHandle, is_interested: bool) -> Option<bool> {
         self.with_live_mut(handle, "mark_peer_interested", |live| {
             let prev = live.peer_interested;
