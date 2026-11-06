@@ -66,6 +66,11 @@ where
     pub peer_has_piece: P,
     /// Returns true if the piece can be stolen (e.g., not locked for writing).
     pub can_steal: S,
+    /// The order the queued pieces are taken in (after `priority_pieces`).
+    pub order: crate::PieceOrder,
+    /// How many peers have each piece, and this torrent's seed for ties (rarest-first).
+    pub availability: Option<&'a crate::piece_order::PieceAvailability>,
+    pub seed: u64,
 }
 
 /// Coordinates piece download state.
@@ -142,17 +147,34 @@ impl PieceTracker {
             }
         }
 
-        // Then check naturally ordered queued pieces
+        // Then the queued pieces, in the torrent's order.
         // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight)
+        let first_and_last_first = match req.order {
+            crate::PieceOrder::InOrder {
+                first_and_last_first,
+            } => first_and_last_first,
+            crate::PieceOrder::RarestFirst => false,
+        };
         let queued: Vec<_> = self
             .chunks
-            .iter_queued_pieces(req.file_priorities, req.file_infos)
+            .iter_queued_pieces(req.file_priorities, req.file_infos, first_and_last_first)
             .collect();
 
-        for piece in queued {
-            if (req.peer_has_piece)(piece) {
-                return self.reserve_piece(piece, req.peer);
-            }
+        let chosen = match (req.order, req.availability) {
+            // The one the fewest peers have, among those this peer has.
+            (crate::PieceOrder::RarestFirst, Some(availability)) => queued
+                .into_iter()
+                .filter(|p| (req.peer_has_piece)(*p))
+                .min_by_key(|p| {
+                    (
+                        availability.get(*p),
+                        crate::piece_order::tie_break(*p, req.seed),
+                    )
+                }),
+            _ => queued.into_iter().find(|p| (req.peer_has_piece)(*p)),
+        };
+        if let Some(piece) = chosen {
+            return self.reserve_piece(piece, req.peer);
         }
 
         // 3. Try steal with 3x threshold (moderately slow peer)
@@ -396,6 +418,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true, // Peer has all pieces
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         // Should reserve piece 0 (first in queue)
@@ -407,6 +432,88 @@ mod tests {
             }
             _ => panic!("Expected Reserved, got {:?}", result),
         }
+    }
+
+    /// The pieces taken one after another (each reserved, so the next call takes another).
+    fn taken(
+        tracker: &mut PieceTracker,
+        order: crate::PieceOrder,
+        availability: Option<&crate::piece_order::PieceAvailability>,
+        has: impl Fn(ValidPieceIndex) -> bool,
+        n: usize,
+    ) -> Vec<u32> {
+        let file_infos = make_test_file_infos(tracker.chunks().get_lengths().total_pieces());
+        let file_priorities = make_default_file_priorities(&file_infos);
+        (0..n)
+            .map_while(|_| {
+                match tracker.acquire_piece(AcquireRequest {
+                    peer: peer(1),
+                    peer_avg_time: None,
+                    priority_pieces: std::iter::empty(),
+                    file_priorities: &file_priorities,
+                    file_infos: &file_infos,
+                    peer_has_piece: &has,
+                    can_steal: |_| true,
+                    order,
+                    availability,
+                    seed: 7,
+                }) {
+                    AcquireResult::Reserved(p) => Some(p.get()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_order_with_or_without_the_ends_first() {
+        let order = |first_and_last_first| crate::PieceOrder::InOrder {
+            first_and_last_first,
+        };
+        let mut t = PieceTracker::new(make_test_chunk_tracker(5));
+        assert_eq!(
+            taken(&mut t, order(true), None, |_| true, 5),
+            [0, 4, 1, 2, 3]
+        );
+        let mut t = PieceTracker::new(make_test_chunk_tracker(5));
+        assert_eq!(
+            taken(&mut t, order(false), None, |_| true, 5),
+            [0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn rarest_first_takes_the_fewest_held_pieces_first() {
+        let mut t = PieceTracker::new(make_test_chunk_tracker(6));
+        let availability = crate::piece_order::PieceAvailability::new(6);
+        // Pieces 0..6 held by 3, 3, 1, 2, 3, 3 peers.
+        for (piece, n) in [3, 3, 1, 2, 3, 3].into_iter().enumerate() {
+            for _ in 0..n {
+                availability.inc(piece);
+            }
+        }
+        let got = taken(
+            &mut t,
+            crate::PieceOrder::RarestFirst,
+            Some(&availability),
+            |_| true,
+            6,
+        );
+        assert_eq!(&got[..2], [2, 3], "the rarest first: {got:?}");
+        let mut rest = got[2..].to_vec();
+        rest.sort_unstable();
+        assert_eq!(rest, [0, 1, 4, 5]);
+        // Only among the pieces the peer has.
+        let mut t = PieceTracker::new(make_test_chunk_tracker(6));
+        let not_2 = |p: ValidPieceIndex| p.get() != 2;
+        let got = taken(
+            &mut t,
+            crate::PieceOrder::RarestFirst,
+            Some(&availability),
+            not_2,
+            1,
+        );
+        assert_eq!(got, [3]);
     }
 
     #[test]
@@ -429,6 +536,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() >= 2,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         match result {
@@ -457,6 +567,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         let piece = match result {
@@ -490,6 +603,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         let piece = match result {
@@ -518,6 +634,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p == piece, // Only has the failed piece
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         match result2 {
@@ -547,6 +666,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -559,6 +681,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -573,6 +698,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -612,6 +740,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
@@ -621,6 +752,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         assert_eq!(tracker.inflight_count(), 2);
@@ -638,6 +772,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         // Should get piece 0 again (was requeued)
@@ -676,6 +813,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         // Should get piece 3 (first priority piece)
@@ -702,6 +842,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| false, // Peer has nothing
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         match result {
@@ -750,6 +893,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 0);
@@ -766,6 +912,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 4);
@@ -788,6 +937,9 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4
             can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
         });
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)

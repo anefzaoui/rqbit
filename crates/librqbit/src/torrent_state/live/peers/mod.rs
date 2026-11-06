@@ -23,6 +23,10 @@ pub(crate) struct PeerStates {
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
+    // How many live peers have each piece (rarest-first). Kept in sync with live peers'
+    // bitfields: update_bitfield, count_have, and a live peer leaving (Peer::set_state,
+    // drop_peer).
+    pub availability: crate::piece_order::PieceAvailability,
 }
 
 impl Drop for PeerStates {
@@ -88,6 +92,9 @@ impl PeerStates {
         let s = p.get_state();
         self.stats.dec(s);
         self.session_stats.dec(s);
+        if let Some(live) = p.get_live() {
+            self.availability.sub(&live.bitfield);
+        }
 
         Some(p)
     }
@@ -118,6 +125,8 @@ impl PeerStates {
         total_pieces: usize,
     ) -> Option<()> {
         self.with_live_mut(handle, "update_bitfield", |live| {
+            self.availability.sub(&live.bitfield);
+            self.availability.add(&bitfield);
             live.bitfield = bitfield;
             self.update_seeder_flag(live, total_pieces);
         })
@@ -203,6 +212,7 @@ mod tests {
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
+            availability: crate::piece_order::PieceAvailability::new(TOTAL_PIECES),
         }
     }
 

@@ -199,6 +199,11 @@ pub struct ManagedTorrentShared {
     /// This torrent's own rate limits, kept across pauses and changeable while it runs
     /// (`ManagedTorrent::set_ratelimits`).
     pub(crate) ratelimits: Arc<crate::limits::Limits>,
+
+    /// The order its pieces are asked for, changeable while it runs
+    /// (`ManagedTorrent::set_piece_order`), and a seed of its own for rarest-first's ties.
+    pub(crate) piece_order: parking_lot::RwLock<crate::PieceOrder>,
+    pub(crate) piece_order_seed: u64,
 }
 
 impl ManagedTorrentShared {
@@ -263,6 +268,17 @@ impl ManagedTorrent {
     pub fn set_ratelimits(&self, config: crate::limits::LimitsConfig) {
         self.shared.ratelimits.set_download_bps(config.download_bps);
         self.shared.ratelimits.set_upload_bps(config.upload_bps);
+    }
+
+    /// The order this torrent's pieces are downloaded in.
+    pub fn piece_order(&self) -> crate::PieceOrder {
+        *self.shared.piece_order.read()
+    }
+
+    /// Change the order its pieces are downloaded in, while it runs or not: the next piece
+    /// each peer is asked for follows it.
+    pub fn set_piece_order(&self, order: crate::PieceOrder) {
+        *self.shared.piece_order.write() = order;
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

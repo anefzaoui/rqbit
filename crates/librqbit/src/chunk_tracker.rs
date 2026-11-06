@@ -233,16 +233,30 @@ impl ChunkTracker {
         hns
     }
 
+    /// The queued pieces of the files still needed, file by file in `file_priorities`' order;
+    /// in each file its first and last pieces first when `first_and_last_first`, else from its
+    /// start to its end.
     pub(crate) fn iter_queued_pieces<'a>(
         &'a self,
         file_priorities: &'a FilePriorities,
         file_infos: &'a FileInfos,
+        first_and_last_first: bool,
     ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
         file_priorities
             .iter()
             .filter_map(|p| Some((*p, file_infos.get(*p)?)))
             .filter(|(id, f)| self.per_file_bytes[*id] != f.len)
-            .flat_map(|(_id, f)| f.iter_piece_priorities())
+            .flat_map(move |(_id, f)| {
+                let (ends_first, in_order) = if first_and_last_first {
+                    (Some(f.iter_piece_priorities()), None)
+                } else {
+                    (None, Some(f.piece_range_usize()))
+                };
+                ends_first
+                    .into_iter()
+                    .flatten()
+                    .chain(in_order.into_iter().flatten())
+            })
             .filter(|id| self.queue_pieces[*id])
             .filter_map(|id| id.try_into().ok())
             .filter_map(|id| self.lengths.validate_piece_index(id))

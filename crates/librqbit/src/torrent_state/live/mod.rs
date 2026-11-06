@@ -273,6 +273,9 @@ impl TorrentStateLive {
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
+                availability: crate::piece_order::PieceAvailability::new(
+                    paused.metadata.lengths().total_pieces() as usize,
+                ),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
@@ -1458,6 +1461,9 @@ impl PeerHandler {
                             .try_write()
                             .is_some()
                     },
+                    order: *self.state.shared.piece_order.read(),
+                    availability: Some(&self.state.peers.availability),
+                    seed: self.state.shared.piece_order_seed,
                 });
 
                 match result {
@@ -1542,7 +1548,12 @@ impl PeerHandler {
                     live.bitfield = make_piece_bitfield(&self.state.lengths);
                 }
                 match live.bitfield.get_mut(have as usize) {
-                    Some(mut v) => *v = true,
+                    Some(mut v) => {
+                        if !*v {
+                            self.state.peers.availability.inc(have as usize);
+                        }
+                        *v = true
+                    }
                     None => {
                         warn!(
                             id = self.state.shared.id,

@@ -284,6 +284,11 @@ pub struct AddTorrentOptions {
     #[serde(default)]
     pub ratelimits: LimitsConfig,
 
+    /// The order its pieces are downloaded in (None: in order, each file's first and last
+    /// pieces first). Changeable later with `ManagedTorrent::set_piece_order`.
+    #[serde(default)]
+    pub piece_order: Option<crate::PieceOrder>,
+
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
@@ -1432,6 +1437,8 @@ impl Session {
             let metadata = Arc::new(metadata);
             let minfo = Arc::new(ManagedTorrentShared {
                 ratelimits: Arc::new(crate::limits::Limits::new(opts.ratelimits)),
+                piece_order: parking_lot::RwLock::new(opts.piece_order.unwrap_or_default()),
+                piece_order_seed: rand::random(),
                 id,
                 span,
                 info_hash,

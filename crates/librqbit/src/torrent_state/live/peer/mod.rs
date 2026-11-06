@@ -146,6 +146,9 @@ impl Peer {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.dec(&self.state);
         }
+        if let PeerState::Live(live) = &self.state {
+            counters.availability.sub(&live.bitfield);
+        }
         if let (Some(addr), PeerState::Live(..)) = (self.outgoing_address, &self.state) {
             counters.live_outgoing_peers.write().remove(&addr);
         }
@@ -154,6 +157,10 @@ impl Peer {
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.incdec(&self.state, &new);
+        }
+        // A live peer's pieces stop counting when it leaves (a new live peer has none yet).
+        if let PeerState::Live(live) = &self.state {
+            counters.availability.sub(&live.bitfield);
         }
         if let Some(addr) = self.outgoing_address {
             if matches!(&self.state, PeerState::Live(..)) {
