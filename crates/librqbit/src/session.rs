@@ -432,6 +432,11 @@ impl Default for DhtSessionConfig {
     }
 }
 
+/// Changes a [`reqwest::ClientBuilder`] before its client is built (see
+/// [`SessionOptions::configure_http_client`]).
+pub type ConfigureHttpClient =
+    Arc<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>;
+
 pub struct SessionOptions {
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
@@ -509,6 +514,12 @@ pub struct SessionOptions {
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
+
+    /// Applied to every HTTP client the session builds (the trackers' and the blocklist's, and
+    /// the UPnP port forwarder's), after the session's own settings (proxy, bound address, user
+    /// agent): a client's own TLS configuration, for example. A system without CA certificates
+    /// can't build reqwest's default one, and the session would not start.
+    pub configure_http_client: Option<ConfigureHttpClient>,
 }
 
 impl Default for SessionOptions {
@@ -539,6 +550,7 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            configure_http_client: None,
         }
     }
 }
@@ -770,6 +782,12 @@ impl Session {
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
+            let configure_http = opts.configure_http_client.clone();
+            let configure_http = move |b: reqwest::ClientBuilder| match &configure_http {
+                Some(f) => f(b),
+                None => b,
+            };
+
             let reqwest_client = {
                 let mut builder = if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
@@ -800,8 +818,7 @@ impl Session {
                     builder = builder.local_address(ip);
                 }
 
-                builder
-                    .user_agent(&client_name_and_version)
+                configure_http(builder.user_agent(&client_name_and_version))
                     .build()
                     .context("error building HTTP(S) client")?
             };
@@ -934,10 +951,11 @@ impl Session {
                 {
                     info!(port = announce_port, "starting UPnP port forwarder");
                     let bind_device = bind_device.clone();
+                    let client = configure_http(reqwest::Client::builder()).build();
                     session.spawn(
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                        Self::task_upnp_port_forwarder(announce_port, bind_device, client),
                     );
                 }
             }
@@ -1100,8 +1118,13 @@ impl Session {
     async fn task_upnp_port_forwarder(
         port: u16,
         bind_device: Option<BindDevice>,
+        client: reqwest::Result<reqwest::Client>,
     ) -> anyhow::Result<()> {
-        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
+        let opts = librqbit_upnp::UpnpPortForwarderOptions {
+            http_client: Some(client.context("error building HTTP client")?),
+            ..Default::default()
+        };
+        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], Some(opts), bind_device)?;
         pf.run_forever().await
     }
 

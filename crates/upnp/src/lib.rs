@@ -78,6 +78,7 @@ pub fn get_local_ip_relative_to(
 }
 
 async fn forward_port(
+    client: &Client,
     control_url: Url,
     local_ip: IpAddr,
     port: u16,
@@ -106,7 +107,6 @@ async fn forward_port(
 
     let url = control_url;
 
-    let client = reqwest::Client::new();
     let response = client
         .post(url.clone())
         .header("Content-Type", "text/xml")
@@ -265,7 +265,16 @@ pub struct UpnpDiscoverResponse {
 }
 
 pub async fn discover_services(location: Url) -> anyhow::Result<RootDesc> {
-    let response = Client::new()
+    // A client that can't be built (no CA certificates on Linux) is an error, not a panic.
+    let client = Client::builder()
+        .build()
+        .context("error building HTTP client")?;
+    discover_services_with(&client, location).await
+}
+
+/// [`discover_services`] with the given HTTP client.
+pub async fn discover_services_with(client: &Client, location: Url) -> anyhow::Result<RootDesc> {
+    let response = client
         .get(location.clone())
         .send()
         .await
@@ -370,6 +379,9 @@ pub struct UpnpPortForwarderOptions {
     pub lease_duration: Duration,
     pub discover_interval: Duration,
     pub discover_timeout: Duration,
+    /// The HTTP client the router is asked with (its description and the port mappings). None:
+    /// a default one, built in [`UpnpPortForwarder::new`].
+    pub http_client: Option<Client>,
 }
 
 impl Default for UpnpPortForwarderOptions {
@@ -378,6 +390,7 @@ impl Default for UpnpPortForwarderOptions {
             discover_interval: Duration::from_secs(60),
             discover_timeout: Duration::from_secs(10),
             lease_duration: Duration::from_secs(60),
+            http_client: None,
         }
     }
 }
@@ -386,6 +399,7 @@ pub struct UpnpPortForwarder {
     ports: Vec<u16>,
     opts: UpnpPortForwarderOptions,
     bind_device: Option<BindDevice>,
+    client: Client,
 }
 
 impl UpnpPortForwarder {
@@ -397,10 +411,18 @@ impl UpnpPortForwarder {
         if ports.is_empty() {
             bail!("empty ports")
         }
+        let mut opts = opts.unwrap_or_default();
+        let client = match opts.http_client.take() {
+            Some(c) => c,
+            None => Client::builder()
+                .build()
+                .context("error building HTTP client")?,
+        };
         Ok(Self {
             ports,
-            opts: opts.unwrap_or_default(),
+            opts,
             bind_device,
+            client,
         })
     }
 
@@ -408,7 +430,8 @@ impl UpnpPortForwarder {
         &self,
         discover_response: UpnpDiscoverResponse,
     ) -> anyhow::Result<UpnpEndpoint> {
-        let services = discover_services(discover_response.location.clone()).await?;
+        let services =
+            discover_services_with(&self.client, discover_response.location.clone()).await?;
         let nics = network_interface::NetworkInterface::show()
             .context("error listing network interfaces")?;
         Ok(UpnpEndpoint {
@@ -450,7 +473,14 @@ impl UpnpPortForwarder {
 
         loop {
             interval.tick().await;
-            if let Err(e) = forward_port(control_url.clone(), local_ip, port, lease_duration).await
+            if let Err(e) = forward_port(
+                &self.client,
+                control_url.clone(),
+                local_ip,
+                port,
+                lease_duration,
+            )
+            .await
             {
                 warn!("failed to forward port: {e:#}");
             }
