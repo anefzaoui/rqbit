@@ -12,6 +12,7 @@ Coordinates piece download state by wrapping `ChunkTracker` and `inflight_pieces
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+    checking: HashSet<ValidPieceIndex>, // taken out of inflight, hash being checked
 }
 
 pub struct InflightPiece {
@@ -22,7 +23,7 @@ pub struct InflightPiece {
 
 Key methods that maintain invariants:
 - `acquire_piece()` - Reserve from queue or steal from slow peer
-- `take_inflight()` - Remove from inflight (before hash check)
+- `take_inflight()` - Remove from inflight into `checking` (before hash check)
 - `mark_piece_hash_ok()` - Mark as completed after hash verification
 - `mark_piece_hash_failed()` - Requeue after hash failure
 - `release_pieces_owned_by()` - Release all pieces owned by a dead peer
@@ -160,7 +161,10 @@ IN_FLIGHT → QUEUED (for all in-flight pieces)
 
 1. `pause()`:
    - Calls `PieceTracker::into_chunks()` which:
-     - For each piece in `inflight`, calls `mark_piece_broken_if_not_have(piece)`
+     - For each piece in `inflight` or `checking`, calls `mark_piece_broken_if_not_have(piece)`
+     - A piece in `checking` is one whose hash check the pause cut short: the check runs
+       without the lock, and once paused it can no longer mark the piece as had. Requeued
+       (chunks cleared), it is fetched again on resume instead of being lost for good.
      - Returns the inner `ChunkTracker`
    - Stores the `ChunkTracker` for resume
 

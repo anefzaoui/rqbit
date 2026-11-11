@@ -7,6 +7,7 @@
 //! - HAVE (completed)
 //! - QUEUED (available to download)
 //! - IN_FLIGHT (currently being downloaded)
+//! - CHECKING (all its chunks are in, its hash is being checked)
 //! - NOT_NEEDED (not selected for download)
 
 use std::{
@@ -87,6 +88,9 @@ where
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+    /// Pieces taken out of `inflight` for their hash check, until it says ok or failed. The
+    /// check runs without the lock, so a pause can come in between.
+    checking: HashSet<ValidPieceIndex>,
 }
 
 impl PieceTracker {
@@ -97,6 +101,7 @@ impl PieceTracker {
         Self {
             chunks,
             inflight: HashMap::new(),
+            checking: HashSet::new(),
         }
     }
 
@@ -105,13 +110,18 @@ impl PieceTracker {
         &self.chunks
     }
 
-    /// Consume the PieceTracker, requeuing any in-flight pieces.
+    /// Consume the PieceTracker, requeuing any in-flight pieces, and those whose hash check
+    /// was still going on.
     ///
     /// This is used when pausing a torrent - any pieces that were being downloaded
-    /// need to be put back in the queue so they can be re-downloaded on resume.
+    /// need to be put back in the queue so they can be re-downloaded on resume. A piece whose
+    /// check the pause cuts short is one of them: its check can no longer mark it as had (the
+    /// paused torrent has no tracker for it), and kept as it is - all chunks in, neither had,
+    /// queued nor in flight - it would never be asked for again, the torrent one piece short
+    /// for good.
     pub fn into_chunks(mut self) -> ChunkTracker {
-        // Requeue all in-flight pieces so they'll be re-downloaded on resume
-        for piece in self.inflight.into_keys() {
+        // Requeue all in-flight and checking pieces so they'll be re-downloaded on resume
+        for piece in self.inflight.into_keys().chain(self.checking) {
             self.chunks.mark_piece_broken_if_not_have(piece);
         }
         self.chunks
@@ -265,16 +275,19 @@ impl PieceTracker {
     /// and then call `mark_piece_hash_ok` or `mark_piece_hash_failed`.
     pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> Option<Duration> {
         let inflight = self.inflight.remove(&piece)?;
+        self.checking.insert(piece);
         Some(inflight.started.elapsed())
     }
 
     /// Mark piece as downloaded after successful hash verification.
     pub fn mark_piece_hash_ok(&mut self, piece: ValidPieceIndex) {
+        self.checking.remove(&piece);
         self.chunks.mark_piece_downloaded(piece);
     }
 
     /// Mark piece as failed after hash verification failure - requeues the piece.
     pub fn mark_piece_hash_failed(&mut self, piece: ValidPieceIndex) {
+        self.checking.remove(&piece);
         self.chunks.mark_piece_broken_if_not_have(piece);
     }
 
@@ -840,6 +853,92 @@ mod tests {
             AcquireResult::Reserved(p) => assert_eq!(p.get(), 0),
             _ => panic!("Expected to reserve piece 0 after into_chunks"),
         }
+    }
+
+    #[test]
+    fn test_into_chunks_requeues_piece_being_checked() {
+        // #706: a pause while a piece's hash is being checked (taken out of in-flight, not
+        // yet marked as had) puts that piece back in the queue too.
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+
+        let piece = match tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
+            skip: 0,
+        }) {
+            AcquireResult::Reserved(p) => p,
+            _ => panic!("Expected Reserved"),
+        };
+
+        // All its chunks are in: out of in-flight, its hash being checked...
+        assert!(tracker.take_inflight(piece).is_some());
+        assert_eq!(tracker.inflight_count(), 0);
+
+        // ...when the torrent is paused.
+        let chunks = tracker.into_chunks();
+        assert!(!chunks.is_piece_have(piece));
+
+        let mut new_tracker = PieceTracker::new(chunks);
+        match new_tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |p| p == piece,
+            can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
+            skip: 0,
+        }) {
+            AcquireResult::Reserved(p) => assert_eq!(p, piece),
+            _ => panic!("Expected the piece cut short in its check to be queued again"),
+        }
+    }
+
+    #[test]
+    fn test_checked_piece_not_requeued_on_pause() {
+        // A piece whose check finished before the pause stays had.
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+
+        let piece = match tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            order: Default::default(),
+            availability: None,
+            seed: 0,
+            skip: 0,
+        }) {
+            AcquireResult::Reserved(p) => p,
+            _ => panic!("Expected Reserved"),
+        };
+        tracker.take_inflight(piece);
+        tracker.mark_piece_hash_ok(piece);
+
+        let chunks = tracker.into_chunks();
+        assert!(chunks.is_piece_have(piece));
     }
 
     #[test]

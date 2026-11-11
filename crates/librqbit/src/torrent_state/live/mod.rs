@@ -2006,11 +2006,20 @@ impl PeerHandler {
                 None => return Ok(()),
             };
 
-            match state
-                .file_ops()
-                .check_piece(chunk_info.piece_index)
-                .with_context(|| format!("error checking piece={index}"))?
-            {
+            let checked = match state.file_ops().check_piece(chunk_info.piece_index) {
+                Ok(checked) => checked,
+                Err(e) => {
+                    // A check that couldn't read the piece (its files taken by a pause, or a
+                    // read error) puts it back in the queue, to be fetched again. Paused, the
+                    // pause has already done so.
+                    if let Some(pieces) = state.lock_write("check_piece_error").pieces.as_mut() {
+                        pieces.mark_piece_hash_failed(chunk_info.piece_index);
+                    }
+                    state.new_pieces_notify.notify_waiters();
+                    return Err(e).with_context(|| format!("error checking piece={index}"));
+                }
+            };
+            match checked {
                 true => {
                     {
                         let mut g = state.lock_write("mark_piece_downloaded");
