@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -1017,27 +1017,50 @@ impl DhtWorker {
         v4.or(v6)
     }
 
-    async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> crate::Result<()> {
+    /// Bootstraps from `addr`, retrying with a backoff until it answers, or until the DHT has
+    /// bootstrapped from another node (`bootstrapped`): a node that is down for good is then
+    /// asked no more, instead of once a minute for a day.
+    async fn bootstrap_hostname_with_backoff(
+        &self,
+        addr: &str,
+        bootstrapped: &AtomicBool,
+    ) -> crate::Result<()> {
         let backoff = ExponentialBuilder::new()
             .with_max_delay(Duration::from_secs(60))
             .with_jitter()
             .with_total_delay(Some(Duration::from_secs(86400)))
             .without_max_times();
 
-        (|| self.bootstrap_hostname(addr))
+        let result = (|| self.bootstrap_hostname(addr))
             .retry(backoff)
+            .when(|_| !bootstrapped.load(Ordering::Relaxed))
             .notify(|error, retry_in| {
                 warn!(?retry_in, ?addr, "error in bootstrap: {error:#}");
             })
             .instrument(debug_span!("bootstrap", hostname = addr))
-            .await
+            .await;
+        match &result {
+            Ok(()) => {
+                bootstrapped.store(true, Ordering::Relaxed);
+                info!(?addr, "bootstrapped");
+            }
+            Err(error) if bootstrapped.load(Ordering::Relaxed) => {
+                debug!(
+                    ?addr,
+                    "not asked again, bootstrapped from another node: {error:#}"
+                );
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     async fn bootstrap(&self, bootstrap_addrs: &[String]) -> crate::Result<()> {
+        let bootstrapped = AtomicBool::new(false);
         let mut futs = FuturesUnordered::new();
 
         for addr in bootstrap_addrs.iter() {
-            futs.push(self.bootstrap_hostname_with_backoff(addr));
+            futs.push(self.bootstrap_hostname_with_backoff(addr, &bootstrapped));
         }
         let mut successes = 0;
         while let Some(resp) = futs.next().await {
@@ -1484,6 +1507,44 @@ mod tests {
         // Let the bootstrap query reach the closed port and the ICMP error come back.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_answers_ping(&dht).await;
+    }
+
+    // A bootstrap node that never answers is asked no more once the DHT has bootstrapped from
+    // another one (it was asked again with a backoff, once a minute, for a day).
+    #[tokio::test]
+    async fn test_dead_bootstrap_node_not_retried_after_bootstrap() {
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        // A node that answers; it bootstraps from a socket that never answers, so it keeps running.
+        let other_silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let live = start_dht(other_silent.local_addr().unwrap()).await;
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec![
+                silent.local_addr().unwrap().to_string(),
+                live.listen_addr().to_string(),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // The first query times out after RESPONSE_TIMEOUT (10 s); a retry would follow within
+        // seconds.
+        let mut queries = 0;
+        let mut buf = [0u8; 2048];
+        let _ = tokio::time::timeout(Duration::from_secs(16), async {
+            loop {
+                if let Ok((_, from)) = silent.recv_from(&mut buf).await
+                    && from == dht.listen_addr()
+                {
+                    queries += 1;
+                }
+            }
+        })
+        .await;
+        // Without the live node's answer it would be asked again too: once means the DHT
+        // bootstrapped from the live node and stopped asking the silent one.
+        assert_eq!(queries, 1, "the silent node was asked again");
     }
 
     // On Windows, a datagram longer than the receive buffer makes recv_from fail with

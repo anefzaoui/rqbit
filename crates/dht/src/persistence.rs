@@ -155,9 +155,15 @@ impl PersistentDht {
                     }
                 },
             };
-            let (stored_port, routing_table, peer_store) = de
-                .map(|de| (Some(de.addr.port()), Some(de.table), de.peer_store))
-                .unwrap_or((None, None, None));
+            let (stored_port, routing_table, routing_table_v6, peer_store) = de
+                .map(|de| {
+                    // The IPv6 table too (it was saved, then left out on load): a start
+                    // without IPv4 nodes that answer still has its IPv6 ones. Only one made
+                    // for the same node id.
+                    let v6 = de.table_v6.filter(|t| t.id() == de.table.id());
+                    (Some(de.addr.port()), Some(de.table), v6, de.peer_store)
+                })
+                .unwrap_or((None, None, None, None));
 
             let mut listen_addr = dht_listen_addr(port, stored_port, ipv4_only);
             if let Some(ip) = listen_ip {
@@ -169,11 +175,11 @@ impl PersistentDht {
                 peer_id,
                 bootstrap_addrs,
                 routing_table,
+                routing_table_v6,
                 listen_addr: Some(listen_addr),
                 peer_store,
                 cancellation_token,
                 bind_device,
-                ..Default::default()
             };
             let dht = DhtState::with_config(dht_config).await?;
             spawn_with_cancel::<anyhow::Error>(
@@ -217,6 +223,49 @@ impl PersistentDht {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both saved routing tables come back on the next start, the IPv6 one included.
+    #[tokio::test]
+    async fn both_routing_tables_are_loaded() {
+        let id = crate::Id20::new([1; 20]);
+        let mut v4 = RoutingTable::new(id, None);
+        v4.add_node(crate::Id20::new([2; 20]), "192.0.2.1:6881".parse().unwrap());
+        let mut v6 = RoutingTable::new(id, None);
+        v6.add_node(
+            crate::Id20::new([3; 20]),
+            "[2001:db8::1]:6881".parse().unwrap(),
+        );
+        let dir = std::env::temp_dir().join(format!("rqbit-dht-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dht.json");
+        let saved = DhtSerialize::<&RoutingTable, &PeerStore> {
+            addr: (Ipv4Addr::LOCALHOST, 0).into(),
+            table: &v4,
+            table_v6: Some(&v6),
+            peer_store: None,
+        };
+        std::fs::write(&file, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+        let token = CancellationToken::new();
+        let dht = PersistentDht::create(
+            DhtPersistenceConfig {
+                dump_interval: None,
+                config_filename: Some(file),
+            },
+            Some(Ipv4Addr::LOCALHOST.into()),
+            None,
+            true,
+            Some(vec![]),
+            Some(token.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let sizes = dht.with_routing_tables(|v4, v6| (v4.len(), v6.len(), v6.id()));
+        token.cancel();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sizes, (1, 1, id));
+    }
 
     #[test]
     fn no_port_no_stored_v6() {
