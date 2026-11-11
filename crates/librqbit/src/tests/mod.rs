@@ -8,4 +8,5 @@ mod e2e_stream;
 mod fake_peer;
 mod http_client_hook;
 mod peer_filter;
+mod session_teardown;
 pub mod test_util;
