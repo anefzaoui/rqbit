@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-use tracker_comms::{TrackerComms, UdpTrackerClient};
+use tracker_comms::{TrackerComms, UdpTrackerAddrFilter, UdpTrackerClient};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
@@ -538,6 +538,12 @@ pub struct SessionOptions {
     /// network). Incoming connections are accepted as before. It is called on the runtime's
     /// threads, again each time an address is named: it must answer at once.
     pub peer_filter: Option<PeerFilter>,
+
+    /// Asked about every address a UDP tracker is to be sent to: each address its name
+    /// resolves to (only the allowed ones are used), or the address the tracker's URL gives.
+    /// One it refuses is sent nothing. HTTP trackers' addresses are the HTTP client's to check
+    /// (`configure_http_client`: a DNS resolver, a redirect policy). None: every address.
+    pub udp_tracker_filter: Option<UdpTrackerAddrFilter>,
 }
 
 impl Default for SessionOptions {
@@ -570,6 +576,7 @@ impl Default for SessionOptions {
             client_name_and_version: None,
             configure_http_client: None,
             peer_filter: None,
+            udp_tracker_filter: None,
         }
     }
 }
@@ -877,10 +884,14 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client =
-                UdpTrackerClient::new(token.clone(), bind_device.as_ref(), udp_tracker_bind_ip)
-                    .await
-                    .context("error creating UDP tracker client")?;
+            let udp_tracker_client = UdpTrackerClient::new_with_filter(
+                token.clone(),
+                bind_device.as_ref(),
+                udp_tracker_bind_ip,
+                opts.udp_tracker_filter,
+            )
+            .await
+            .context("error creating UDP tracker client")?;
 
             let lsd = {
                 if opts.disable_local_service_discovery {
