@@ -521,10 +521,17 @@ pub struct SessionOptions {
     pub client_name_and_version: Option<String>,
 
     /// Applied to every HTTP client the session builds (the trackers' and the blocklist's, and
-    /// the UPnP port forwarder's), after the session's own settings (proxy, bound address, user
-    /// agent): a client's own TLS configuration, for example. A system without CA certificates
-    /// can't build reqwest's default one, and the session would not start.
+    /// the UPnP port forwarder's unless `configure_upnp_http_client` is set), after the
+    /// session's own settings (proxy, bound address, user agent): a client's own TLS
+    /// configuration, for example. A system without CA certificates can't build reqwest's
+    /// default one, and the session would not start.
     pub configure_http_client: Option<ConfigureHttpClient>,
+
+    /// The UPnP port forwarder's own HTTP client (the router's description and its port
+    /// mappings), built from reqwest's default builder: the router is on the local network,
+    /// where the trackers' client may be kept from going. The forwarder only asks the device
+    /// that answered its search, at that device's address. None: `configure_http_client`.
+    pub configure_upnp_http_client: Option<ConfigureHttpClient>,
 
     /// Asked about every peer address someone else names, before it is used: the trackers',
     /// the DHT's, other peers' (PEX), and the one an incoming peer says it listens on (the
@@ -577,6 +584,7 @@ impl Default for SessionOptions {
             configure_http_client: None,
             peer_filter: None,
             udp_tracker_filter: None,
+            configure_upnp_http_client: None,
         }
     }
 }
@@ -982,7 +990,10 @@ impl Session {
                 {
                     info!(port = announce_port, "starting UPnP port forwarder");
                     let bind_device = bind_device.clone();
-                    let client = configure_http(reqwest::Client::builder()).build();
+                    let client = match &opts.configure_upnp_http_client {
+                        Some(configure) => configure(reqwest::Client::builder()).build(),
+                        None => configure_http(reqwest::Client::builder()).build(),
+                    };
                     session.spawn(
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
