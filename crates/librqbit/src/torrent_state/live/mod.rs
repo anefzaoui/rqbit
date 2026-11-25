@@ -50,7 +50,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -512,6 +512,8 @@ impl TorrentStateLive {
             first_message_received: AtomicBool::new(false),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
+            pex_task_started: AtomicBool::new(false),
+            pex_peers_taken: AtomicUsize::new(0),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
         let options = PeerConnectionOptions {
@@ -576,6 +578,8 @@ impl TorrentStateLive {
             first_message_received: AtomicBool::new(false),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
+            pex_task_started: AtomicBool::new(false),
+            pex_peers_taken: AtomicUsize::new(0),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
 
@@ -1075,6 +1079,13 @@ struct PeerHandler {
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
+
+    // Whether the task sending this peer PEX messages runs: one per connection, however many
+    // extended handshakes the peer sends.
+    pex_task_started: AtomicBool,
+
+    // How many peers this peer's PEX messages named that were taken (PEX_MAX_PEERS_PER_CONNECTION).
+    pex_peers_taken: AtomicUsize,
 }
 
 impl PeerConnectionHandler for &'_ PeerHandler {
@@ -1216,7 +1227,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
+        if !self.state.metadata.info.info().private
+            && hs.m.ut_pex.is_some()
+            && !self.pex_task_started.swap(true, Ordering::Relaxed)
+        {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -2129,17 +2143,21 @@ impl PeerHandler {
     }
 
     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
-        msg.dropped_peers()
-            .chain(msg.added_peers())
-            .filter(|peer| self.state.peer_allowed(peer.addr))
-            .for_each(|peer| {
+        let taken = self.pex_peers_taken.load(Ordering::Relaxed);
+        let peers: Vec<SocketAddr> = pex_peers_to_take(&msg, taken).collect();
+        self.pex_peers_taken
+            .fetch_add(peers.len(), Ordering::Relaxed);
+        peers
+            .into_iter()
+            .filter(|addr| self.state.peer_allowed(*addr))
+            .for_each(|addr| {
                 self.state
-                    .add_peer_if_not_seen(peer.addr)
+                    .add_peer_if_not_seen(addr)
                     .map_err(|error| {
                         warn!(
                             id = self.state.shared.id,
                             info_hash = ?self.state.shared.info_hash,
-                            ?peer,
+                            peer = ?addr,
                             "failed to add peer: {error:#}"
                         );
                         error
@@ -2201,6 +2219,27 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     Some(client_name)
 }
 
+/// The most added peers, and the most dropped ones, taken from one PEX message (BEP 11: a
+/// message names at most 50 of each).
+const PEX_MAX_PEERS_PER_MESSAGE: usize = 50;
+
+/// The most peers taken from one connection's PEX messages in all.
+const PEX_MAX_PEERS_PER_CONNECTION: usize = 1000;
+
+/// The peers a PEX message names that are taken, when `taken` were already taken from the same
+/// connection: at most [`PEX_MAX_PEERS_PER_MESSAGE`] dropped and as many added ones, and no more
+/// than [`PEX_MAX_PEERS_PER_CONNECTION`] in all.
+fn pex_peers_to_take<'a>(
+    msg: &'a UtPex<ByteBuf<'a>>,
+    taken: usize,
+) -> impl Iterator<Item = SocketAddr> + 'a {
+    msg.dropped_peers()
+        .take(PEX_MAX_PEERS_PER_MESSAGE)
+        .chain(msg.added_peers().take(PEX_MAX_PEERS_PER_MESSAGE))
+        .map(|peer| peer.addr)
+        .take(PEX_MAX_PEERS_PER_CONNECTION.saturating_sub(taken))
+}
+
 /// Where an incoming peer says it listens: its extended handshake's port, at the address it
 /// names there, else the one it connected from. None without a port, or when that address
 /// isn't `allowed`: it is one someone else names (`SessionOptions::peer_filter`).
@@ -2224,7 +2263,42 @@ mod tests {
     use librqbit_core::compact_ip::Compact;
     use peer_binary_protocol::extended::handshake::ExtendedHandshake;
 
-    use super::listen_addr_of_incoming;
+    use super::{
+        PEX_MAX_PEERS_PER_CONNECTION, PEX_MAX_PEERS_PER_MESSAGE, listen_addr_of_incoming,
+        pex_peers_to_take,
+    };
+
+    #[test]
+    fn a_pex_message_gives_at_most_50_added_and_50_dropped_peers_and_a_connection_1000() {
+        use peer_binary_protocol::extended::ut_pex::UtPex;
+        let addrs = |first: u16, n: u16| {
+            (0..n)
+                .map(move |i| SocketAddr::from((Ipv4Addr::new(198, 51, 100, 1), first + i)))
+                .collect::<Vec<_>>()
+        };
+        let msg = UtPex::from_addrs(addrs(1000, 300).into_iter(), addrs(5000, 300).into_iter());
+        let bytes = {
+            let mut buf = Vec::new();
+            bencode::bencode_serialize_to_writer(&msg, &mut buf).unwrap();
+            buf
+        };
+        let msg: UtPex<ByteBuf> = bencode::from_bytes(&bytes).unwrap();
+        assert_eq!(msg.added_peers().count(), 300);
+        let taken: Vec<_> = pex_peers_to_take(&msg, 0).collect();
+        assert_eq!(taken.len(), 2 * PEX_MAX_PEERS_PER_MESSAGE);
+        assert_eq!(
+            taken.iter().filter(|a| a.port() < 5000).count(),
+            PEX_MAX_PEERS_PER_MESSAGE
+        );
+        assert_eq!(
+            pex_peers_to_take(&msg, PEX_MAX_PEERS_PER_CONNECTION - 7).count(),
+            7
+        );
+        assert_eq!(
+            pex_peers_to_take(&msg, PEX_MAX_PEERS_PER_CONNECTION).count(),
+            0
+        );
+    }
 
     const NAMED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
 
