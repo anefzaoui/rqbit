@@ -104,6 +104,13 @@ impl std::fmt::Debug for SupportedTracker {
     }
 }
 
+/// How long to wait before the next announce to an HTTP tracker: its `interval`, never
+/// under its `min interval`, and never under 5 seconds (as for UDP trackers), so a tracker
+/// that answers 0 isn't asked again in a tight loop.
+fn http_announce_interval(interval: u64, min_interval: Option<u64>) -> Duration {
+    Duration::from_secs(interval.max(min_interval.unwrap_or(0)).max(5))
+}
+
 /// Drives one tracker monitor to its end and logs how it ended. A panic in the monitor ends only
 /// that tracker.
 async fn run_isolated(url: Url, monitor: impl Future<Output = anyhow::Result<()>>) {
@@ -370,8 +377,9 @@ impl TrackerComms {
         for peer in response.iter_peers() {
             self.tx.send(peer).await?;
         }
-        Ok(Duration::from_secs(
-            response.interval.max(response.min_interval.unwrap_or(0)),
+        Ok(http_announce_interval(
+            response.interval,
+            response.min_interval,
         ))
     }
 
@@ -505,7 +513,10 @@ mod tests {
     use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
     use url::Url;
 
-    use super::{UdpTrackerResolveResult, read_body_capped, run_isolated, udp_tracker_to_socket_addrs};
+    use super::{
+        UdpTrackerResolveResult, http_announce_interval, read_body_capped, run_isolated,
+        udp_tracker_to_socket_addrs,
+    };
 
     /// A server on loopback that answers one request with `body`, with or without its length.
     async fn answer_once(body: Vec<u8>, with_length: bool) -> String {
@@ -619,5 +630,27 @@ mod tests {
             "every monitor ends, none of them unwinds into the poller"
         );
         assert_eq!(finished.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_http_announce_interval() {
+        use std::time::Duration;
+        // `interval` is the normal wait; `min interval` is only a floor (BEP 3 and the
+        // common extension), it used to be taken in its place.
+        assert_eq!(
+            http_announce_interval(1800, Some(900)),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            http_announce_interval(1800, None),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            http_announce_interval(600, Some(900)),
+            Duration::from_secs(900)
+        );
+        // A tracker that answers 0 isn't asked again at once.
+        assert_eq!(http_announce_interval(0, None), Duration::from_secs(5));
+        assert_eq!(http_announce_interval(0, Some(0)), Duration::from_secs(5));
     }
 }
