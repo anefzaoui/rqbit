@@ -410,8 +410,13 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
         encdetect.guess(None, chardetng::Utf8Detection::Allow)
     }
 
+    /// `name.utf-8` when it says something, else `name`: an empty `name.utf-8` (as for an
+    /// empty `path.utf-8`, see [`TorrentMetaV1File::raw_path`]) doesn't hide the name.
     fn raw_name(&self) -> Option<&BufType> {
-        self.name_utf8.as_ref().or(self.name.as_ref())
+        self.name_utf8
+            .as_ref()
+            .filter(|n| !n.as_ref().is_empty())
+            .or(self.name.as_ref())
     }
 
     pub(crate) fn iter_file_details_raw(
@@ -826,5 +831,62 @@ mod tests {
             .map(|f| f.filename.to_string())
             .collect();
         assert_eq!(files[0], "原.txt");
+    }
+
+    // An empty `name.utf-8` falls back to `name`, as an empty `path.utf-8` falls back to
+    // `path`: a single-file torrent with one would otherwise have no file name and be refused.
+    #[test]
+    fn test_empty_utf8_name_falls_back_to_name() {
+        let pieces = vec![0u8; 20];
+        let info = bdict(&[
+            (b"length".as_slice(), bint(10)),
+            (b"name".as_slice(), bstr(b"file.txt")),
+            (b"name.utf-8".as_slice(), bstr(b"")),
+            (b"piece length".as_slice(), bint(16384)),
+            (b"pieces".as_slice(), bstr(&pieces)),
+        ]);
+        let top = bdict(&[(b"info".as_slice(), info)]);
+
+        let torrent = from_bytes::<TorrentMetaV1Borrowed>(&top).unwrap();
+        let validated = torrent.info.data.validate().unwrap();
+        assert_eq!(validated.name().as_deref(), Some("file.txt"));
+        let files: Vec<String> = validated
+            .iter_file_details()
+            .map(|f| f.filename.to_string())
+            .collect();
+        assert_eq!(files, vec!["file.txt"]);
+    }
+
+    // A `path.utf-8` is held to the same rules as `path`: no way out of the torrent's folder.
+    #[test]
+    fn test_utf8_path_is_validated_like_path() {
+        let pieces = vec![0u8; 20];
+        let mut path = vec![b'l'];
+        path.extend_from_slice(&bstr(b"ok.txt"));
+        path.push(b'e');
+        let mut path_utf8 = vec![b'l'];
+        path_utf8.extend_from_slice(&bstr(b".."));
+        path_utf8.extend_from_slice(&bstr(b"evil.txt"));
+        path_utf8.push(b'e');
+        let mut flist = vec![b'l'];
+        flist.extend_from_slice(&bdict(&[
+            (b"length".as_slice(), bint(10)),
+            (b"path".as_slice(), path),
+            (b"path.utf-8".as_slice(), path_utf8),
+        ]));
+        flist.push(b'e');
+        let info = bdict(&[
+            (b"files".as_slice(), flist),
+            (b"name".as_slice(), bstr(b"t")),
+            (b"piece length".as_slice(), bint(16384)),
+            (b"pieces".as_slice(), bstr(&pieces)),
+        ]);
+        let top = bdict(&[(b"info".as_slice(), info)]);
+
+        let torrent = from_bytes::<TorrentMetaV1Borrowed>(&top).unwrap();
+        assert!(matches!(
+            torrent.info.data.validate(),
+            Err(crate::Error::BadTorrentPathTraversal)
+        ));
     }
 }
