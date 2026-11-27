@@ -8,7 +8,9 @@
 //!
 //! A handle is only closed when nothing reads or writes through it ([`CachedHandle::try_close`]
 //! never waits). If every handle is busy, an open goes over the budget rather than wait: that
-//! can't be more than the reads and writes in flight.
+//! can't be more than the reads and writes in flight. Closing one doesn't write it to disk (a
+//! closed file's data is the system's to write, as an open one's is); what was written through
+//! it is still written to disk when its torrent is paused, as before.
 //!
 //! Locks: a file's own lock may be held while the registry's is taken, never the other way
 //! round (the registry only *tries* a file's lock, from outside its own).
@@ -27,14 +29,16 @@ use parking_lot::Mutex;
 pub trait CachedHandle: Send + Sync {
     /// When it was last used ([`OpenFiles::now`] at that use).
     fn last_used(&self) -> u64;
-    /// Closes the handle if no read or write uses it now, without waiting, after writing to
-    /// disk what was written through it, and tells the budget ([`OpenFiles::closed`]). Whether
-    /// it closed it.
+    /// Closes the handle if no read or write uses it now, without waiting, and tells the budget
+    /// ([`OpenFiles::closed`]). It still knows it was written through, so that a pause writes it
+    /// to disk. Whether it closed it.
     fn try_close(&self) -> bool;
 }
 
 /// How many handles may be open, which are, and a clock to tell which was used last.
 pub struct OpenFiles {
+    /// 0: [`default_max`], read again at each open, so that a process that raises its limit
+    /// (`try_increase_nofile_limit`) gets more.
     max: AtomicUsize,
     clock: AtomicU64,
     ids: AtomicU64,
@@ -44,7 +48,7 @@ pub struct OpenFiles {
 /// The budget every torrent of the process shares (see [`default_max`]).
 pub fn global() -> &'static OpenFiles {
     static GLOBAL: OnceLock<OpenFiles> = OnceLock::new();
-    GLOBAL.get_or_init(|| OpenFiles::new(default_max()))
+    GLOBAL.get_or_init(OpenFiles::following_the_system)
 }
 
 /// What the global budget allows unless told otherwise: a quarter of the process's limit on
@@ -67,8 +71,17 @@ pub fn default_max() -> usize {
 
 impl OpenFiles {
     pub fn new(max: usize) -> Self {
+        Self::with(max.max(1))
+    }
+
+    /// A budget of [`default_max`], as the system's limit is at each open.
+    pub fn following_the_system() -> Self {
+        Self::with(0)
+    }
+
+    fn with(max: usize) -> Self {
         Self {
-            max: AtomicUsize::new(max.max(1)),
+            max: AtomicUsize::new(max),
             clock: AtomicU64::new(1),
             ids: AtomicU64::new(1),
             open: Mutex::new(HashMap::new()),
@@ -76,7 +89,10 @@ impl OpenFiles {
     }
 
     pub fn max(&self) -> usize {
-        self.max.load(Ordering::Relaxed)
+        match self.max.load(Ordering::Relaxed) {
+            0 => default_max(),
+            max => max,
+        }
     }
 
     /// A new budget; handles over it are closed as files are opened.
@@ -232,7 +248,7 @@ mod tests {
     struct Fake {
         entry: Entry,
         open: RwLock<bool>,
-        synced: AtomicBool,
+        closed_once: AtomicBool,
     }
 
     impl CachedHandle for Fake {
@@ -246,7 +262,7 @@ mod tests {
             if !*g {
                 return false;
             }
-            self.synced.store(true, Ordering::Relaxed);
+            self.closed_once.store(true, Ordering::Relaxed);
             *g = false;
             self.entry.closed();
             true
@@ -261,7 +277,7 @@ mod tests {
         let f = Arc::new(Fake {
             entry: Entry::new(budget),
             open: RwLock::new(false),
-            synced: AtomicBool::new(false),
+            closed_once: AtomicBool::new(false),
         });
         use_it(&f);
         f
@@ -282,9 +298,9 @@ mod tests {
         let files: Vec<_> = (0..100).map(|_| open(budget)).collect();
         assert_eq!(budget.open_count(), 8);
         assert_eq!(files.iter().filter(|f| *f.open.read()).count(), 8);
-        // The last ones opened are the ones still open; the others were synced and closed.
+        // The last ones opened are the ones still open; the others were closed.
         assert!(files[92..].iter().all(|f| *f.open.read()));
-        assert!(files[..92].iter().all(|f| f.synced.load(Ordering::Relaxed)));
+        assert!(files[..92].iter().all(|f| f.closed_once.load(Ordering::Relaxed)));
     }
 
     #[test]
@@ -341,5 +357,9 @@ mod tests {
     fn test_default_budget_is_sane() {
         let m = default_max();
         assert!((16..=1024).contains(&m), "{m}");
+        assert_eq!(OpenFiles::following_the_system().max(), m);
+        let pinned = OpenFiles::following_the_system();
+        pinned.set_max(7);
+        assert_eq!(pinned.max(), 7);
     }
 }

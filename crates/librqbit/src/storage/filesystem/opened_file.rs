@@ -168,7 +168,8 @@ struct OpenedFileLocked {
 struct Shared {
     entry: Entry,
     file: RwLock<OpenedFileLocked>,
-    /// Written through since it was opened: written to disk before the handle closes.
+    /// Written through since it was last written to disk ([`OpenedFile::close`] does, opening
+    /// it again if the budget closed it meanwhile).
     written: AtomicBool,
 }
 
@@ -185,21 +186,14 @@ impl CachedHandle for Shared {
         self.entry.last_used()
     }
 
-    /// Closed by the budget: only when no read or write uses it, after writing what was
-    /// written through it to disk (as a pause does: the data is there before a bitfield that
-    /// claims it). If that fails the handle stays, and the error comes with the next close.
+    /// Closed by the budget: only when no read or write uses it. It isn't written to disk here
+    /// (that would cost a sync for every file of a torrent of thousands): it stays `written`,
+    /// and a pause writes it to disk, as it did when every file was held open.
     fn try_close(&self) -> bool {
         let Some(mut g) = self.file.try_write() else {
             return false;
         };
-        let Some(fd) = g.fd.as_ref() else {
-            return false;
-        };
-        if self.written.swap(false, Ordering::AcqRel)
-            && let Err(e) = fd.sync_data()
-        {
-            self.written.store(true, Ordering::Release);
-            tracing::warn!(path=?g.path, error=?e, "error writing a file to disk; kept open");
+        if g.fd.is_none() {
             return false;
         }
         drop(g.fd.take());
@@ -298,25 +292,52 @@ impl OpenedFile {
                 g.len_when_made = Some(len);
                 return Ok(());
             }
+            // As long already (a torrent resumed, or seeded): nothing to open or write.
+            if g.exists && std::fs::metadata(&g.path).is_ok_and(|m| m.is_file() && m.len() == len)
+            {
+                return Ok(());
+            }
         }
         Ok(self.for_write()?.set_len(len)?)
     }
 
     /// Writes what was written through the handle to disk and closes it (the torrent is
-    /// paused). The next read or write opens the file again.
+    /// paused). The next read or write opens the file again. A file the budget closed after it
+    /// was written is opened again for this, by its path: written to disk before the bitfield
+    /// that counts its pieces, as when every file was held open. One gone since has nothing of
+    /// ours left to write.
     pub fn close(&self) -> anyhow::Result<()> {
         let mut g = self.shared.file.write();
         // Taking the lock for writing waited for every read and write still using the handle.
-        let Some(fd) = g.fd.take() else {
-            return Ok(());
-        };
-        self.shared.entry.closed();
+        let fd = g.fd.take();
+        if fd.is_some() {
+            self.shared.entry.closed();
+        }
         let path = g.path.clone();
         drop(g);
-        if self.shared.written.swap(false, Ordering::AcqRel) {
-            fd.sync_data()
-                .with_context(|| format!("error writing {path:?} to disk"))?;
+        if !self.shared.written.swap(false, Ordering::AcqRel) {
+            return Ok(());
         }
+        let fd = match fd {
+            Some(fd) => fd,
+            None if path.as_os_str().is_empty() => return Ok(()),
+            // Writing a file to disk takes a handle that can write, on Windows.
+            None => match std::fs::OpenOptions::new()
+                .read(true)
+                .write(cfg!(windows))
+                .open(&path)
+            {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    self.shared.written.store(true, Ordering::Release);
+                    return Err(e)
+                        .with_context(|| format!("error opening {path:?} to write it to disk"));
+                }
+            },
+        };
+        fd.sync_data()
+            .with_context(|| format!("error writing {path:?} to disk"))?;
         Ok(())
     }
 
@@ -593,6 +614,19 @@ mod tests {
     }
 
     #[test]
+    fn test_a_file_as_long_already_is_not_written_for_its_length() {
+        let td = TempDir::with_prefix("test_as_long_already").unwrap();
+        let path = td.path().join("a");
+        std::fs::write(&path, b"hello").unwrap();
+        let file = OpenedFile::lazy(path.clone(), true, false, budget(64));
+        file.ensure_len(5).unwrap();
+        assert!(!file.is_open(), "nothing opened");
+        assert!(!file.shared.written.load(super::Ordering::Acquire));
+        file.ensure_len(8).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    }
+
+    #[test]
     fn test_an_empty_file_is_made_when_its_length_is_asked() {
         let td = TempDir::with_prefix("test_empty_made").unwrap();
         let path = td.path().join("empty");
@@ -627,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_budget_closes_the_least_recently_used_after_syncing_it() {
+    fn test_the_budget_closes_the_least_recently_used_and_a_pause_syncs_it() {
         let td = TempDir::with_prefix("test_budget_closes").unwrap();
         let budget = budget(4);
         let files: Vec<_> = (0..20)
@@ -643,12 +677,15 @@ mod tests {
             .collect();
         assert_eq!(files.iter().filter(|f| f.is_open()).count(), 4);
         assert!(files[16..].iter().all(|f| f.is_open()), "the latest stay open");
-        // Closed by the budget: what was written was written to disk first.
-        assert!(
-            files[..16]
-                .iter()
-                .all(|f| !f.shared.written.load(super::Ordering::Acquire))
-        );
+        // Closed by the budget, still to be written to disk: a pause does it, opening each
+        // again for that, and leaves it closed.
+        let written = |f: &OpenedFile| f.shared.written.load(super::Ordering::Acquire);
+        assert!(files[..16].iter().all(|f| written(f) && !f.is_open()));
+        for f in &files {
+            f.close().unwrap();
+            assert!(!written(f) && !f.is_open());
+        }
+        assert_eq!(budget.open_count(), 0);
         // And each opens again where it is, with its bytes.
         for (i, f) in files.iter().enumerate() {
             let want = i.to_string();
