@@ -226,8 +226,10 @@ impl OpenedFile {
     /// On Windows a handle that can write keeps other programs out of the file: one can't run
     /// it, and any program that opens it without sharing writing (most do, copying or reading it)
     /// gets a sharing violation. So there the handle becomes a read-only one of the same file,
-    /// shared for reading and deleting: others can read, run, rename, move and delete it while
-    /// it is seeded. Elsewhere an open file stops none of that, and the handle stays as it is.
+    /// with std's sharing (read, write, delete): others can read, run, rename, move and delete it
+    /// while it is seeded. Sharing writing too keeps whoever opens it for writing able to (MDM's
+    /// own app does, checking a seeded torrent's files again when one is ticked). Elsewhere an
+    /// open file stops none of that, and the handle stays as it is.
     pub fn mark_finished(&self) -> anyhow::Result<()> {
         let mut g = self.file.write();
         if g.path.as_os_str().is_empty() {
@@ -321,7 +323,6 @@ impl OpenedFileLocked {
         }
         let read_only = !write && self.finished && cfg!(windows);
         // What this replaces, if anything, is a read-only handle: nothing to write to disk.
-        // Closed first: on Windows it keeps writers out, this one among them.
         drop(self.fd.take());
         self.fd = Some(open_existing(&self.path, read_only)?);
         self.read_only = read_only;
@@ -331,22 +332,12 @@ impl OpenedFileLocked {
 
 /// Opens a file `init` made, without making it again.
 fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(!read_only);
-    #[cfg(windows)]
-    if read_only {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(SHARE_READ_DELETE);
-    }
-    match options.open(path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(!read_only)
+        .open(path)
+    {
         Ok(f) => Ok(f),
-        // Another program has it open for writing: shared with writers as well (std's
-        // default), rather than not opened.
-        #[cfg(windows)]
-        Err(e) if read_only && super::fs::is_sharing_violation(&e) => std::fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .with_context(|| format!("error opening {path:?} again")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e).with_context(|| {
             format!("{path:?} is gone: it was moved or deleted while the torrent was paused")
         }),
@@ -354,14 +345,9 @@ fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<File> {
     }
 }
 
-/// FILE_SHARE_READ | FILE_SHARE_DELETE.
-#[cfg(windows)]
-const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
-
 /// Windows: a read-only handle to the same file as `file`, which is closed (on error it is given
-/// back). The new handle is shared for reading and deleting only, so other programs may read,
-/// run, rename, move and delete the file but not write to it, unless another program already
-/// has it open for writing: then it shares writing too, as std's handles do.
+/// back), shared as std's handles are (read, write, delete): other programs may read, run,
+/// rename, move and delete the file while it is held.
 ///
 /// It is opened from the handle (`ReOpenFile`), not by name: it is the same file even if the
 /// name was changed or replaced meanwhile.
@@ -372,34 +358,25 @@ pub fn into_read_only(file: File) -> Result<File, (File, std::io::Error)> {
     use windows::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{
-            FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, ReOpenFile,
         },
     };
-    let reopen = |f: &File, share: FILE_SHARE_MODE| -> std::io::Result<File> {
-        // SAFETY: `f`'s handle is open for the whole call. ReOpenFile returns a new handle,
-        // which only the File made here owns and closes.
-        unsafe {
-            let h = ReOpenFile(
-                HANDLE(f.as_raw_handle()),
-                FILE_GENERIC_READ.0,
-                share,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-            )?;
-            Ok(File::from_raw_handle(h.0))
-        }
+    // SAFETY: `file`'s handle is open for the whole call. ReOpenFile returns a new handle, which
+    // only the File made here owns and closes.
+    let reopened = unsafe {
+        ReOpenFile(
+            HANDLE(file.as_raw_handle()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+        .map(|h| File::from_raw_handle(h.0))
     };
-    // Our own handle can still write, so this one has to share writing with it.
-    let wide = match reopen(
-        &file,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    ) {
-        Ok(f) => f,
-        Err(e) => return Err((file, e)),
-    };
-    drop(file);
-    // Now nothing of ours writes: one that keeps writers out, unless another program writes.
-    Ok(reopen(&wide, FILE_SHARE_READ | FILE_SHARE_DELETE).unwrap_or(wide))
+    match reopened {
+        Ok(read_only) => Ok(read_only),
+        Err(e) => Err((file, e.into())),
+    }
 }
 
 #[cfg(test)]
@@ -501,8 +478,15 @@ mod tests {
         let mut other = String::new();
         std::io::Read::read_to_string(&mut reader().unwrap(), &mut other).unwrap();
         assert_eq!(other, "hello");
-        // Nobody may write to it while it is seeded.
-        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        // A program that opens it to write still can (MDM's app does, checking a seeded
+        // torrent's files again): the read-only handle shares writing, as std's do.
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
         let moved = td.path().join("b.exe");
         std::fs::rename(&path, &moved).unwrap();
         assert_eq!(read(&file, 5), b"hello", "the handle follows the file");

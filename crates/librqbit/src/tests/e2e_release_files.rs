@@ -174,7 +174,8 @@ async fn test_file_moved_while_paused_is_an_error() -> anyhow::Result<()> {
 }
 
 // Finished and seeding: every other program can read the file (Windows: even one that keeps
-// writers out), rename it while it is seeded, and peers still get its blocks.
+// writers out, which a handle of ours that could write refused), rename it while it is seeded,
+// and peers still get its blocks.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_finished_file_is_shared_while_seeding() -> anyhow::Result<()> {
     run(async {
@@ -226,13 +227,17 @@ async fn test_finished_file_is_shared_while_seeding() -> anyhow::Result<()> {
         let pieces = peer.expect_pieces(1, Duration::from_secs(10)).await?;
         assert_eq!(pieces[0].2, seed.block(3, 0, BLOCK));
         #[cfg(windows)]
-        assert!(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&client.file)
-                .is_err(),
-            "no writer while it is seeded"
-        );
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            assert!(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0x1) // FILE_SHARE_READ
+                    .open(&client.file)
+                    .is_ok(),
+                "opened again read-only: a reader that keeps writers out gets it"
+            );
+        }
         client.session.delete(id(&client), false).await?;
         Ok(())
     })
