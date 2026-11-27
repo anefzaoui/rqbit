@@ -26,12 +26,12 @@ use super::opened_file::OpenedFile;
 /// this can surface as. Nothing equivalent happens on Unix, where an open
 /// handle does not restrict other opens, so the check is compiled out.
 #[cfg(windows)]
-fn is_sharing_violation(e: &std::io::Error) -> bool {
+pub(super) fn is_sharing_violation(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(32) | Some(33))
 }
 
 #[cfg(not(windows))]
-fn is_sharing_violation(_: &std::io::Error) -> bool {
+pub(super) fn is_sharing_violation(_: &std::io::Error) -> bool {
     false
 }
 
@@ -81,16 +81,16 @@ impl TorrentStorage for FilesystemStorage {
         self.opened_files
             .get(file_id)
             .context("no such file")?
-            .lock_read()?
+            .for_read()?
             .pread_exact(offset, buf)
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
-        let of = self.opened_files.get(file_id).context("no such file")?;
-        #[cfg(windows)]
-        return of.try_mark_sparse()?.pwrite_all(offset, buf);
-        #[cfg(not(windows))]
-        return of.lock_read()?.pwrite_all(offset, buf);
+        self.opened_files
+            .get(file_id)
+            .context("no such file")?
+            .for_write()?
+            .pwrite_all(offset, buf)
     }
 
     fn pwrite_all_vectored(
@@ -99,11 +99,11 @@ impl TorrentStorage for FilesystemStorage {
         offset: u64,
         bufs: [IoSlice<'_>; 2],
     ) -> anyhow::Result<usize> {
-        let of = self.opened_files.get(file_id).context("no such file")?;
-        #[cfg(windows)]
-        return of.try_mark_sparse()?.pwrite_all_vectored(offset, bufs);
-        #[cfg(not(windows))]
-        return of.lock_read()?.pwrite_all_vectored(offset, bufs);
+        self.opened_files
+            .get(file_id)
+            .context("no such file")?
+            .for_write()?
+            .pwrite_all_vectored(offset, bufs)
     }
 
     fn remove_file(&self, _file_id: usize, filename: &Path) -> anyhow::Result<()> {
@@ -111,10 +111,12 @@ impl TorrentStorage for FilesystemStorage {
     }
 
     fn ensure_file_length(&self, file_id: usize, len: u64) -> anyhow::Result<()> {
-        let f = &self.opened_files.get(file_id).context("no such file")?;
-        #[cfg(windows)]
-        f.try_mark_sparse()?;
-        Ok(f.lock_read()?.set_len(len)?)
+        Ok(self
+            .opened_files
+            .get(file_id)
+            .context("no such file")?
+            .for_write()?
+            .set_len(len)?)
     }
 
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
@@ -126,6 +128,25 @@ impl TorrentStorage for FilesystemStorage {
                 .collect::<anyhow::Result<Vec<_>>>()?,
             output_folder: self.output_folder.clone(),
         }))
+    }
+
+    /// Every file is written to disk and closed; each opens again by its path on its next read
+    /// or write, never made again (see `OpenedFile`). Every file is closed even when one fails.
+    fn close_files(&self) -> anyhow::Result<()> {
+        let mut first_error = None;
+        for file in &self.opened_files {
+            if let Err(e) = file.close() {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn on_file_completed(&self, file_id: usize) -> anyhow::Result<()> {
+        self.opened_files
+            .get(file_id)
+            .context("no such file")?
+            .mark_finished()
     }
 
     fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
@@ -157,6 +178,7 @@ impl TorrentStorage for FilesystemStorage {
                 continue;
             };
             std::fs::create_dir_all(full_path.parent().context("bug: no parent")?)?;
+            let mut read_only = false;
             let f = if shared.options.allow_overwrite {
                 let opened = OpenOptions::new()
                     .create(true)
@@ -176,6 +198,7 @@ impl TorrentStorage for FilesystemStorage {
                     // first write instead, which is a narrower failure than
                     // refusing to add it at all.
                     Err(e) if is_sharing_violation(&e) => {
+                        read_only = true;
                         warn!(
                             path=?full_path,
                             error=?e,
@@ -208,7 +231,7 @@ impl TorrentStorage for FilesystemStorage {
                     })?;
                 OpenOptions::new().read(true).write(true).open(&full_path)?
             };
-            files.push(OpenedFile::new(full_path.clone(), f));
+            files.push(OpenedFile::new(full_path.clone(), f, read_only));
         }
 
         self.opened_files = files;

@@ -1,12 +1,13 @@
 use std::{
     fs::File,
     io::IoSlice,
-    ops::{Deref, DerefMut},
-    path::PathBuf,
+    ops::Deref,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use anyhow::Context;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::Error;
 
@@ -130,92 +131,275 @@ fn pwrite_all_unvectored(
     Ok(bufs[0].len() + bufs[1].len())
 }
 
+/// What an [`OpenedFile`] holds. The path stays when the handle is closed, so that the file can
+/// be opened again; an empty path is padding, or what [`OpenedFile::take_clone`] left behind,
+/// which never opens anything.
 #[derive(Default, Debug)]
 struct OpenedFileLocked {
-    #[allow(unused)]
     path: PathBuf,
     fd: Option<File>,
+    /// `fd` can only read: a finished file on Windows, or one another program kept us from
+    /// opening for writing at init.
+    read_only: bool,
+    /// Every piece of the file is ours ([`OpenedFile::mark_finished`]): it is only read from
+    /// now on.
+    finished: bool,
     #[cfg(windows)]
     tried_marking_sparse: bool,
 }
 
-impl Deref for OpenedFileLocked {
-    type Target = Option<File>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.fd
-    }
-}
-
-impl DerefMut for OpenedFileLocked {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.fd
-    }
-}
-
+/// A file of the torrent, opened by the storage's `init`.
+///
+/// Its handle is closed when the torrent is paused ([`Self::close`]) and opened again on the
+/// next read or write, by the path it had: never created, so a file moved or deleted while the
+/// torrent was paused is an error rather than a new empty file written into as though it held
+/// the pieces.
 #[derive(Debug)]
 pub(crate) struct OpenedFile {
     file: RwLock<OpenedFileLocked>,
+    /// Written through since it was opened: written to disk before the handle closes.
+    written: AtomicBool,
 }
 
 impl OpenedFile {
-    pub fn new(path: PathBuf, f: File) -> Self {
+    /// `read_only`: `f` can't write (see `FilesystemStorage::init`).
+    pub fn new(path: PathBuf, f: File, read_only: bool) -> Self {
         Self {
             file: RwLock::new(OpenedFileLocked {
                 path,
                 fd: Some(f),
-                #[cfg(windows)]
-                tried_marking_sparse: false,
+                read_only,
+                ..Default::default()
             }),
+            written: AtomicBool::new(false),
         }
     }
 
     pub fn new_dummy() -> Self {
         Self {
             file: RwLock::new(Default::default()),
+            written: AtomicBool::new(false),
         }
     }
 
+    /// Moves the file, handle and all, to a new OpenedFile and leaves this one useless: it
+    /// never opens the file again. This is how a torrent's files go from one state to the next.
     pub fn take_clone(&self) -> anyhow::Result<Self> {
         let f = std::mem::take(&mut *self.file.write());
         Ok(Self {
             file: RwLock::new(f),
+            written: AtomicBool::new(self.written.swap(false, Ordering::AcqRel)),
         })
     }
 
-    pub fn lock_read(&self) -> crate::Result<impl Deref<Target = File>> {
-        RwLockReadGuard::try_map(self.file.read(), |f| f.as_ref())
-            .ok()
-            .ok_or(Error::FsFileIsNone)
+    /// The handle to read with, opened again if it was closed.
+    pub fn for_read(&self) -> anyhow::Result<impl Deref<Target = File> + '_> {
+        self.handle(false)
     }
 
-    #[allow(dead_code)]
-    pub fn lock_write(&self) -> crate::Result<impl DerefMut<Target = File>> {
-        RwLockWriteGuard::try_map(self.file.write(), |f| f.as_mut())
-            .ok()
-            .ok_or(Error::FsFileIsNone)
+    /// A handle that can write: opened again (read/write) if it was closed or is read-only.
+    pub fn for_write(&self) -> anyhow::Result<impl Deref<Target = File> + '_> {
+        let f = self.handle(true)?;
+        self.written.store(true, Ordering::Release);
+        Ok(f)
     }
 
-    #[cfg(windows)]
-    pub fn try_mark_sparse(&self) -> crate::Result<impl Deref<Target = File>> {
+    /// Writes what was written through the handle to disk and closes it (the torrent is
+    /// paused). The next read or write opens the file again.
+    pub fn close(&self) -> anyhow::Result<()> {
+        let mut g = self.file.write();
+        // Taking the lock for writing waited for every read and write still using the handle.
+        let Some(fd) = g.fd.take() else {
+            return Ok(());
+        };
+        let path = g.path.clone();
+        drop(g);
+        if self.written.swap(false, Ordering::AcqRel) {
+            fd.sync_data()
+                .with_context(|| format!("error writing {path:?} to disk"))?;
+        }
+        Ok(())
+    }
+
+    /// Every piece of the file is ours and verified: it is only read from now on.
+    ///
+    /// On Windows a handle that can write keeps other programs out of the file: one can't run
+    /// it, and any program that opens it without sharing writing (most do, copying or reading it)
+    /// gets a sharing violation. So there the handle becomes a read-only one of the same file,
+    /// shared for reading and deleting: others can read, run, rename, move and delete it while
+    /// it is seeded. Elsewhere an open file stops none of that, and the handle stays as it is.
+    pub fn mark_finished(&self) -> anyhow::Result<()> {
+        let mut g = self.file.write();
+        if g.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        g.finished = true;
+        #[cfg(windows)]
+        if !g.read_only
+            && let Some(fd) = g.fd.take()
         {
-            let g = self.file.read();
-            if g.tried_marking_sparse {
-                return RwLockReadGuard::try_map(g, |f| f.fd.as_ref())
-                    .ok()
-                    .ok_or(Error::FsFileIsNone);
+            if self.written.swap(false, Ordering::AcqRel)
+                && let Err(e) = fd.sync_data()
+            {
+                g.fd = Some(fd);
+                return Err(e).with_context(|| format!("error writing {:?} to disk", g.path));
+            }
+            match into_read_only(fd) {
+                Ok(read_only) => {
+                    g.fd = Some(read_only);
+                    g.read_only = true;
+                }
+                Err((fd, e)) => {
+                    g.fd = Some(fd);
+                    return Err(e).with_context(|| format!("error opening {:?} read-only", g.path));
+                }
             }
         }
-        let mut g = self.file.write();
-        if !g.tried_marking_sparse {
-            g.tried_marking_sparse = true;
-            let f = g.fd.as_ref().ok_or(Error::FsFileIsNone)?;
-            let marked = super::sparse::mark_file_sparse(f);
-            tracing::debug!(path=?g.path, marked, "marking sparse");
-        }
-        let g = parking_lot::RwLockWriteGuard::downgrade(g);
-        Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())
+        Ok(())
     }
+
+    /// Whether a handle is open now.
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.file.read().fd.is_some()
+    }
+
+    /// The handle if it can do what is asked, otherwise one opened for it.
+    fn handle(&self, write: bool) -> anyhow::Result<MappedRwLockReadGuard<'_, File>> {
+        let g = self.file.read();
+        let g = if g.usable(write) {
+            g
+        } else {
+            drop(g);
+            let mut w = self.file.write();
+            if !w.usable(write) {
+                w.prepare(write)?;
+            }
+            RwLockWriteGuard::downgrade(w)
+        };
+        RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).map_err(|_| Error::FsFileIsNone.into())
+    }
+}
+
+impl OpenedFileLocked {
+    fn usable(&self, write: bool) -> bool {
+        if self.fd.is_none() {
+            return false;
+        }
+        if !write {
+            return true;
+        }
+        #[cfg(windows)]
+        if !self.tried_marking_sparse {
+            return false;
+        }
+        !self.read_only
+    }
+
+    /// Makes the handle fit for what is asked, under the lock.
+    fn prepare(&mut self, write: bool) -> anyhow::Result<()> {
+        if self.fd.is_none() || (write && self.read_only) {
+            self.reopen(write)?;
+        }
+        #[cfg(windows)]
+        if write && !self.tried_marking_sparse {
+            self.tried_marking_sparse = true;
+            if let Some(f) = self.fd.as_ref() {
+                let marked = super::sparse::mark_file_sparse(f);
+                tracing::debug!(path=?self.path, marked, "marking sparse");
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the file again by its path. A finished file is opened read-only on Windows (see
+    /// [`OpenedFile::mark_finished`]) unless it is to be written; anything else read/write, as
+    /// `init` opened it.
+    fn reopen(&mut self, write: bool) -> anyhow::Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Err(Error::FsFileIsNone.into());
+        }
+        let read_only = !write && self.finished && cfg!(windows);
+        // What this replaces, if anything, is a read-only handle: nothing to write to disk.
+        // Closed first: on Windows it keeps writers out, this one among them.
+        drop(self.fd.take());
+        self.fd = Some(open_existing(&self.path, read_only)?);
+        self.read_only = read_only;
+        Ok(())
+    }
+}
+
+/// Opens a file `init` made, without making it again.
+fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(!read_only);
+    #[cfg(windows)]
+    if read_only {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(SHARE_READ_DELETE);
+    }
+    match options.open(path) {
+        Ok(f) => Ok(f),
+        // Another program has it open for writing: shared with writers as well (std's
+        // default), rather than not opened.
+        #[cfg(windows)]
+        Err(e) if read_only && super::fs::is_sharing_violation(&e) => std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .with_context(|| format!("error opening {path:?} again")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e).with_context(|| {
+            format!("{path:?} is gone: it was moved or deleted while the torrent was paused")
+        }),
+        Err(e) => Err(e).with_context(|| format!("error opening {path:?} again")),
+    }
+}
+
+/// FILE_SHARE_READ | FILE_SHARE_DELETE.
+#[cfg(windows)]
+const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
+
+/// Windows: a read-only handle to the same file as `file`, which is closed (on error it is given
+/// back). The new handle is shared for reading and deleting only, so other programs may read,
+/// run, rename, move and delete the file but not write to it, unless another program already
+/// has it open for writing: then it shares writing too, as std's handles do.
+///
+/// It is opened from the handle (`ReOpenFile`), not by name: it is the same file even if the
+/// name was changed or replaced meanwhile.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn into_read_only(file: File) -> Result<File, (File, std::io::Error)> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_MODE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        },
+    };
+    let reopen = |f: &File, share: FILE_SHARE_MODE| -> std::io::Result<File> {
+        // SAFETY: `f`'s handle is open for the whole call. ReOpenFile returns a new handle,
+        // which only the File made here owns and closes.
+        unsafe {
+            let h = ReOpenFile(
+                HANDLE(f.as_raw_handle()),
+                FILE_GENERIC_READ.0,
+                share,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+            )?;
+            Ok(File::from_raw_handle(h.0))
+        }
+    };
+    // Our own handle can still write, so this one has to share writing with it.
+    let wide = match reopen(
+        &file,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    ) {
+        Ok(f) => f,
+        Err(e) => return Err((file, e)),
+    };
+    drop(file);
+    // Now nothing of ours writes: one that keeps writers out, unless another program writes.
+    Ok(reopen(&wide, FILE_SHARE_READ | FILE_SHARE_DELETE).unwrap_or(wide))
 }
 
 #[cfg(test)]
@@ -227,6 +411,145 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::storage::filesystem::opened_file::OurFileExt;
+
+    use super::OpenedFile;
+    use crate::tests::test_util::held;
+
+    fn opened(dir: &TempDir, name: &str, bytes: &[u8]) -> (std::path::PathBuf, OpenedFile) {
+        let path = dir.path().join(name);
+        let f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let file = OpenedFile::new(path.clone(), f, false);
+        file.for_write().unwrap().pwrite_all(0, bytes).unwrap();
+        (path, file)
+    }
+
+    fn read(file: &OpenedFile, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        file.for_read().unwrap().pread_exact(0, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_close_releases_the_file_and_a_read_opens_it_again() {
+        let td = TempDir::with_prefix("test_close_releases").unwrap();
+        let (path, file) = opened(&td, "a", b"hello");
+        assert_ne!(held(&path), Some(false), "open before closing");
+        file.close().unwrap();
+        assert!(!file.is_open());
+        assert_ne!(held(&path), Some(true), "a closed file holds no handle");
+        // Closed, the file can be renamed and renamed back by anyone, on every system.
+        let moved = td.path().join("a-moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::rename(&moved, &path).unwrap();
+        assert_eq!(read(&file, 5), b"hello");
+        assert!(file.is_open());
+        file.for_write().unwrap().pwrite_all(5, b"!").unwrap();
+        file.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn test_a_taken_file_never_opens_again() {
+        let td = TempDir::with_prefix("test_a_taken_file").unwrap();
+        let (_path, file) = opened(&td, "a", b"hello");
+        let taken = file.take_clone().unwrap();
+        // A late write of the state the file was taken from must not get a handle of its own.
+        assert!(file.for_write().is_err());
+        assert!(file.for_read().is_err());
+        assert!(!file.is_open());
+        assert_eq!(read(&taken, 5), b"hello");
+        // What was written before the move is still written to disk when the new one closes.
+        assert!(taken.written.load(super::Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_a_file_gone_while_closed_is_an_error_not_a_new_file() {
+        let td = TempDir::with_prefix("test_a_file_gone").unwrap();
+        let (path, file) = opened(&td, "a", b"hello");
+        file.close().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let e = format!("{:#}", file.for_write().err().unwrap());
+        assert!(e.contains("moved or deleted"), "{e}");
+        let e = format!("{:#}", file.for_read().err().unwrap());
+        assert!(e.contains("moved or deleted"), "{e}");
+        assert!(!path.exists(), "a file gone is not made again");
+    }
+
+    // Windows: a finished file is held read-only and shared, so other programs can read it
+    // without sharing writing, rename it and delete it, and it is still seeded from.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_finished_file_is_read_only_and_shared() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let td = TempDir::with_prefix("test_a_finished_file").unwrap();
+        let (path, file) = opened(&td, "a.exe", b"hello");
+        // Before: our handle can write, and a reader that doesn't share writing is refused.
+        let reader = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1) // FILE_SHARE_READ
+                .open(&path)
+        };
+        assert!(reader().is_err(), "a writer of ours keeps such readers out");
+        file.mark_finished().unwrap();
+        assert!(file.is_open(), "a finished file stays open, to be seeded");
+        let mut other = String::new();
+        std::io::Read::read_to_string(&mut reader().unwrap(), &mut other).unwrap();
+        assert_eq!(other, "hello");
+        // Nobody may write to it while it is seeded.
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        let moved = td.path().join("b.exe");
+        std::fs::rename(&path, &moved).unwrap();
+        assert_eq!(read(&file, 5), b"hello", "the handle follows the file");
+        std::fs::remove_file(&moved).unwrap();
+        assert!(!moved.exists());
+    }
+
+    // Windows: closed and opened again, a finished file is opened read-only; a write still
+    // gets a handle that can write.
+    #[cfg(windows)]
+    #[test]
+    fn test_a_finished_file_opened_again_is_read_only() {
+        let td = TempDir::with_prefix("test_finished_again").unwrap();
+        let (path, file) = opened(&td, "a", b"hello");
+        file.mark_finished().unwrap();
+        file.close().unwrap();
+        assert_eq!(held(&path), Some(false));
+        assert_eq!(read(&file, 5), b"hello");
+        let moved = td.path().join("b");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::rename(&moved, &path).unwrap();
+        file.for_write().unwrap().pwrite_all(0, b"J").unwrap();
+        file.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"Jello");
+    }
+
+    // The read-only handle into_read_only() gives is the same file, even under another name.
+    #[cfg(windows)]
+    #[test]
+    fn test_into_read_only_keeps_the_same_file() {
+        let td = TempDir::with_prefix("test_into_read_only").unwrap();
+        let path = td.path().join("a");
+        std::fs::write(&path, b"hello").unwrap();
+        let rw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let moved = td.path().join("b");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"other").unwrap();
+        let ro = super::into_read_only(rw).map_err(|(_, e)| e).unwrap();
+        let mut buf = [0u8; 5];
+        ro.pread_exact(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        assert!(ro.pwrite_all(0, b"x").is_err(), "read-only");
+    }
 
     // Writes every split of a random buffer at `offset` with `write`, and checks the file
     // holds exactly those bytes there.

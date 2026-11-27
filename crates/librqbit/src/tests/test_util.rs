@@ -19,6 +19,38 @@ pub fn setup_test_logging() {
     let _ = tracing_subscriber::fmt::try_init();
 }
 
+/// Whether any handle of this process has `path` open (None: this system can't say).
+/// Windows: an open that shares nothing fails while any other handle is open. Linux: an entry
+/// of /proc/self/fd leads to it.
+pub fn held(path: &Path) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .is_err(),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let want = std::fs::canonicalize(path).ok()?;
+        Some(
+            std::fs::read_dir("/proc/self/fd")
+                .ok()?
+                .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+                .any(|p| p == want),
+        )
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 pub fn create_new_file_with_random_content(path: &Path, mut size: usize) {
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
