@@ -2,6 +2,7 @@ mod e2e;
 mod e2e_another_local_client;
 mod e2e_have;
 mod e2e_init_pause;
+mod e2e_lazy_files;
 mod e2e_network_back;
 mod e2e_padded_files;
 mod e2e_pause_bitv;
