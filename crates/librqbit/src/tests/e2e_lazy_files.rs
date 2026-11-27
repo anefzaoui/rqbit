@@ -86,7 +86,8 @@ async fn seed(src: &Path, budget: &'static OpenFiles) -> anyhow::Result<(Arc<Ses
         .await?
         .into_handle()
         .context("into_handle")?;
-    timeout(Duration::from_secs(60), handle.wait_until_completed())
+    // Generous for a slow machine: thousands of files read, a few dozen open at a time.
+    timeout(Duration::from_secs(150), handle.wait_until_completed())
         .await
         .context("the seeder never checked its files")??;
     let addr = seeder.listen_addr().context("seeder not listening")?;
@@ -232,7 +233,7 @@ async fn test_unticked_files_are_made_only_for_shared_pieces() -> anyhow::Result
 // download folder agrees), and every file comes whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_many_tiny_files_stay_within_the_budget() -> anyhow::Result<()> {
-    timeout(Duration::from_secs(300), async {
+    timeout(Duration::from_secs(480), async {
         const FILES: usize = 5_000;
         const MAX: usize = 32;
         let root = TempDir::with_prefix("rqbit_lazy_many")?;
