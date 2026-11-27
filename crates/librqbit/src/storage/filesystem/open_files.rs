@@ -231,7 +231,6 @@ impl Entry {
     }
 
     /// Counted in, open already ([`OpenFiles::opened`]).
-
     pub fn opened<T: CachedHandle + 'static>(&self, me: &Arc<T>) {
         let weak: Weak<T> = Arc::downgrade(me);
         let weak: Weak<dyn CachedHandle> = weak;

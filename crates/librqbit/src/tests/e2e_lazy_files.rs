@@ -143,7 +143,7 @@ fn listing(dir: &Path) -> Vec<String> {
 
 fn bytes(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
-        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .map(|i| i.to_le_bytes()[0].wrapping_mul(31).wrapping_add(seed))
         .collect()
 }
 
@@ -248,7 +248,7 @@ async fn test_many_tiny_files_stay_within_the_budget() -> anyhow::Result<()> {
             .map(|i| {
                 (
                     format!("d{:02}/f{i:05}.bin", i % 50),
-                    bytes(1 + (i * 37) % 300, i as u8),
+                    bytes(1 + (i * 37) % 300, i.to_le_bytes()[0]),
                 )
             })
             .collect();
