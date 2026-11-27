@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -54,6 +54,12 @@ pub struct DhtStats {
     pub outstanding_requests: usize,
     pub routing_table_size: usize,
     pub routing_table_size_v6: usize,
+    /// Requests a node answered (an answer or an error message), since the start. A client
+    /// that watches the network reads a stretch with no answers while requests time out as
+    /// the network being gone, and the next answer as it being back.
+    pub responses: u64,
+    /// Requests no node answered within the response timeout, since the start.
+    pub timeouts: u64,
 }
 
 struct OutstandingRequest {
@@ -347,7 +353,9 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
             "get_peers",
             async move {
                 let this = &this;
-                // Looper adds root nodes to the queue every 60 seconds.
+                // Looper adds root nodes to the queue every 60 seconds, or at once after
+                // `requery_now`.
+                let mut requery = this.dht.requery.subscribe();
                 let looper = {
                     async move {
                         let mut iteration = 0;
@@ -362,7 +370,13 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                                     return Err::<(), crate::Error>(e);
                                 }
                             };
-                            tokio::time::sleep(sleep).await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(sleep) => {}
+                                // The sender lives as long as the DHT this task holds.
+                                Ok(()) = requery.changed() => {
+                                    debug!("asked to query again now");
+                                }
+                            }
                             iteration += 1;
                         }
                     }
@@ -590,6 +604,14 @@ pub struct DhtState {
     cancellation_token: CancellationToken,
 
     pub(crate) peer_store: PeerStore,
+
+    // Counted for `DhtStats::responses` and `DhtStats::timeouts`.
+    responses: AtomicU64,
+    timeouts: AtomicU64,
+
+    // Bumped by `requery_now`: every running peer lookup asks its closest nodes again at once
+    // instead of at its next turn.
+    requery: tokio::sync::watch::Sender<u64>,
 }
 
 impl DhtState {
@@ -615,6 +637,9 @@ impl DhtState {
             rate_limiter: make_rate_limiter(),
             peer_store,
             cancellation_token,
+            responses: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            requery: tokio::sync::watch::Sender::new(0),
         }
     }
 
@@ -640,6 +665,7 @@ impl DhtState {
         match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
             Ok(Ok(r)) => r.map(|r| {
                 trace!("received {r:?}");
+                self.responses.fetch_add(1, Ordering::Relaxed);
                 r
             }),
             Ok(Err(_)) => {
@@ -648,6 +674,7 @@ impl DhtState {
             }
             Err(_) => {
                 self.inflight_by_transaction_id.remove(&key);
+                self.timeouts.fetch_add(1, Ordering::Relaxed);
                 Err(Error::ResponseTimeout(RESPONSE_TIMEOUT))
             }
         }
@@ -934,7 +961,18 @@ impl DhtState {
             outstanding_requests: self.inflight_by_transaction_id.len(),
             routing_table_size: self.routing_table_v4.read().len(),
             routing_table_size_v6: self.routing_table_v6.read().len(),
+            responses: self.responses.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
         }
+    }
+
+    /// Every running peer lookup (`get_peers`) asks its closest nodes again now rather than
+    /// at its next turn (up to `REQUERY_INTERVAL`, a minute, away). For a client that saw the
+    /// network come back: the peers known before it went may be gone or moved. A lookup asks
+    /// no more often than this is called, so a caller that calls it once per network change
+    /// adds one round of requests per change.
+    pub fn requery_now(&self) {
+        self.requery.send_modify(|n| *n = n.wrapping_add(1));
     }
 }
 
@@ -1455,7 +1493,7 @@ mod tests {
 
     use super::{DhtConfig, DhtState};
     use crate::{
-        Dht,
+        Dht, Id20,
         bprotocol::{self, MessageKind},
     };
 
@@ -1545,6 +1583,91 @@ mod tests {
         // Without the live node's answer it would be asked again too: once means the DHT
         // bootstrapped from the live node and stopped asking the silent one.
         assert_eq!(queries, 1, "the silent node was asked again");
+    }
+
+    const NODE_ID: Id20 = librqbit_core::hash_id::Id([7u8; 20]);
+
+    // A node that answers every query with a bare response (its id, no peers) and counts the
+    // get_peers queries it got.
+    async fn counting_node() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let Ok(msg) = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]) else {
+                    continue;
+                };
+                if matches!(msg.kind, MessageKind::GetPeersRequest(_)) {
+                    let _ = tx.send(());
+                }
+                // To find_node it names itself, so the DHT puts it in its routing table.
+                let nodes = matches!(msg.kind, MessageKind::FindNodeRequest(_)).then(|| {
+                    let SocketAddr::V4(v4) = addr else {
+                        unreachable!()
+                    };
+                    bprotocol::CompactNodeInfo::new_from_iter(
+                        [bprotocol::Node {
+                            id: NODE_ID,
+                            addr: v4,
+                        }]
+                        .into_iter(),
+                    )
+                });
+                let mut out = Vec::new();
+                bprotocol::serialize_message(
+                    &mut out,
+                    msg.transaction_id,
+                    None,
+                    None,
+                    MessageKind::Response(bprotocol::Response {
+                        id: NODE_ID,
+                        values: None,
+                        nodes,
+                        nodes6: None,
+                        token: None,
+                    }),
+                )
+                .unwrap();
+                let _ = socket.send_to(&out, from).await;
+            }
+        });
+        (addr, rx)
+    }
+
+    // After the network comes back, a running peer lookup asks its nodes again when told
+    // (`requery_now`), not at its next turn; and only once per call.
+    #[tokio::test]
+    async fn test_requery_now_asks_again_at_once() {
+        let (node, mut get_peers) = counting_node().await;
+        let dht = start_dht(node).await;
+        let before = dht.stats();
+        let _lookup = dht.get_peers(Id20::new([1u8; 20]), None);
+
+        // The first round, at once.
+        tokio::time::timeout(Duration::from_secs(5), get_peers.recv())
+            .await
+            .expect("the lookup never asked the node");
+        // One node in the table: the next turn is REQUERY_INTERVAL / 8 (7.5 s) away.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while get_peers.try_recv().is_ok() {}
+
+        dht.requery_now();
+        tokio::time::timeout(Duration::from_secs(2), get_peers.recv())
+            .await
+            .expect("requery_now didn't ask the node again at once");
+
+        // Asked once for one call: nothing more until the lookup's next turn.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(get_peers.try_recv().is_err(), "asked more than once");
+
+        let after = dht.stats();
+        assert!(after.responses >= before.responses + 2, "{after:?}");
+        assert_eq!(after.timeouts, 0, "{after:?}");
     }
 
     // On Windows, a datagram longer than the receive buffer makes recv_from fail with
