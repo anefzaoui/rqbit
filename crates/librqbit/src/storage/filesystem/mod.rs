@@ -1,4 +1,5 @@
 mod fs;
+pub mod open_files;
 mod opened_file;
 mod sparse;
 
