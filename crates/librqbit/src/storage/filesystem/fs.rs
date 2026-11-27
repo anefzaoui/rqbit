@@ -1,5 +1,4 @@
 use std::{
-    fs::OpenOptions,
     io::IoSlice,
     path::{Path, PathBuf},
 };
@@ -14,7 +13,7 @@ use crate::{
 
 use crate::storage::{StorageFactory, TorrentStorage};
 
-use super::opened_file::OpenedFile;
+use super::{open_files::OpenFiles, opened_file::OpenedFile};
 
 /// Whether an open failed because another process holds the file.
 ///
@@ -35,8 +34,21 @@ pub(super) fn is_sharing_violation(_: &std::io::Error) -> bool {
     false
 }
 
+/// Files are made on their first write and opened on use, within a budget of open handles
+/// ([`open_files::global`](super::open_files::global) unless [`Self::with_open_files`]).
 #[derive(Default, Clone, Copy)]
-pub struct FilesystemStorageFactory {}
+pub struct FilesystemStorageFactory {
+    open_files: Option<&'static OpenFiles>,
+}
+
+impl FilesystemStorageFactory {
+    /// Handles counted in `budget` instead of the process's.
+    pub fn with_open_files(budget: &'static OpenFiles) -> Self {
+        Self {
+            open_files: Some(budget),
+        }
+    }
+}
 
 impl StorageFactory for FilesystemStorageFactory {
     type Storage = FilesystemStorage;
@@ -49,6 +61,7 @@ impl StorageFactory for FilesystemStorageFactory {
         Ok(FilesystemStorage {
             output_folder: shared.options.output_folder.clone(),
             opened_files: Default::default(),
+            open_files: self.open_files.unwrap_or_else(super::open_files::global),
         })
     }
 
@@ -60,10 +73,10 @@ impl StorageFactory for FilesystemStorageFactory {
 pub struct FilesystemStorage {
     pub(crate) output_folder: PathBuf,
     pub(crate) opened_files: Vec<OpenedFile>,
+    open_files: &'static OpenFiles,
 }
 
 impl FilesystemStorage {
-    #[allow(dead_code)]
     pub(crate) fn take_fs(&self) -> anyhow::Result<Self> {
         Ok(Self {
             opened_files: self
@@ -72,6 +85,7 @@ impl FilesystemStorage {
                 .map(|f| f.take_clone())
                 .collect::<anyhow::Result<Vec<_>>>()?,
             output_folder: self.output_folder.clone(),
+            open_files: self.open_files,
         })
     }
 }
@@ -107,27 +121,24 @@ impl TorrentStorage for FilesystemStorage {
     }
 
     fn remove_file(&self, _file_id: usize, filename: &Path) -> anyhow::Result<()> {
-        Ok(std::fs::remove_file(self.output_folder.join(filename))?)
+        match std::fs::remove_file(self.output_folder.join(filename)) {
+            // Never made: nothing was written to it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => Ok(r?),
+        }
     }
 
+    /// A file not made yet gets this length when it is (its first write); see
+    /// [`OpenedFile::ensure_len`].
     fn ensure_file_length(&self, file_id: usize, len: u64) -> anyhow::Result<()> {
-        Ok(self
-            .opened_files
+        self.opened_files
             .get(file_id)
             .context("no such file")?
-            .for_write()?
-            .set_len(len)?)
+            .ensure_len(len)
     }
 
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
-        Ok(Box::new(Self {
-            opened_files: self
-                .opened_files
-                .iter()
-                .map(|f| f.take_clone())
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            output_folder: self.output_folder.clone(),
-        }))
+        Ok(Box::new(self.take_fs()?))
     }
 
     /// Every file is written to disk and closed; each opens again by its path on its next read
@@ -162,6 +173,9 @@ impl TorrentStorage for FilesystemStorage {
         }
     }
 
+    /// Nothing is made nor opened here: each file is made by its first write and opened when it
+    /// is read or written (see [`OpenedFile`]). With `allow_overwrite` off, a file already
+    /// there is still refused now.
     fn init(
         &mut self,
         shared: &ManagedTorrentShared,
@@ -174,64 +188,22 @@ impl TorrentStorage for FilesystemStorage {
             full_path.push(relative_path);
 
             if file_details.attrs.padding {
-                files.push(OpenedFile::new_dummy());
+                files.push(OpenedFile::new_dummy(self.open_files));
                 continue;
             };
-            std::fs::create_dir_all(full_path.parent().context("bug: no parent")?)?;
-            let mut read_only = false;
-            let f = if shared.options.allow_overwrite {
-                let opened = OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&full_path);
-
-                match opened {
-                    Ok(f) => f,
-                    // Another process holds this file in a way that permits
-                    // reading but not writing. Seeding only ever reads, so
-                    // falling back to a read-only handle lets a completed
-                    // torrent be served instead of failing the whole add.
-                    //
-                    // A torrent that still has data to fetch will fail on the
-                    // first write instead, which is a narrower failure than
-                    // refusing to add it at all.
-                    Err(e) if is_sharing_violation(&e) => {
-                        read_only = true;
-                        warn!(
-                            path=?full_path,
-                            error=?e,
-                            "opening read/write failed because another process holds the file; \
-                             falling back to read-only. This torrent can be seeded but not written to."
-                        );
-                        OpenOptions::new().read(true).open(&full_path).with_context(|| {
-                            format!(
-                                "error opening {full_path:?} read-only after a sharing violation"
-                            )
-                        })?
-                    }
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("error opening {full_path:?} in read/write mode")
-                        });
-                    }
-                }
-            } else {
-                // create_new does not seem to work with read(true), so calling this twice.
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&full_path)
-                    .with_context(|| {
-                        format!(
-                            "error creating a new file (because allow_overwrite = false) {:?}",
-                            full_path
-                        )
-                    })?;
-                OpenOptions::new().read(true).write(true).open(&full_path)?
-            };
-            files.push(OpenedFile::new(full_path.clone(), f, read_only));
+            let exists = full_path.symlink_metadata().is_ok();
+            if exists && !shared.options.allow_overwrite {
+                anyhow::bail!(
+                    "error creating a new file (because allow_overwrite = false) {full_path:?}: \
+                     it exists"
+                );
+            }
+            files.push(OpenedFile::lazy(
+                full_path,
+                exists,
+                !shared.options.allow_overwrite,
+                self.open_files,
+            ));
         }
 
         self.opened_files = files;

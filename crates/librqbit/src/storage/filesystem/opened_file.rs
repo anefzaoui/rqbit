@@ -3,13 +3,21 @@ use std::{
     io::IoSlice,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Context;
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::Error;
+
+use super::{
+    fs::is_sharing_violation,
+    open_files::{CachedHandle, Entry, OpenFiles},
+};
 
 pub trait OurFileExt {
     fn pwrite_all_vectored(&self, offset: u64, bufs: [IoSlice<'_>; 2]) -> anyhow::Result<usize>;
@@ -131,6 +139,7 @@ fn pwrite_all_unvectored(
     Ok(bufs[0].len() + bufs[1].len())
 }
 
+
 /// What an [`OpenedFile`] holds. The path stays when the handle is closed, so that the file can
 /// be opened again; an empty path is padding, or what [`OpenedFile::take_clone`] left behind,
 /// which never opens anything.
@@ -138,83 +147,173 @@ fn pwrite_all_unvectored(
 struct OpenedFileLocked {
     path: PathBuf,
     fd: Option<File>,
-    /// `fd` can only read: a finished file on Windows, or one another program kept us from
-    /// opening for writing at init.
+    /// `fd` can only read: opened for a read, or a finished file on Windows.
     read_only: bool,
     /// Every piece of the file is ours ([`OpenedFile::mark_finished`]): it is only read from
     /// now on.
     finished: bool,
+    /// The file is on disk: made by us, or found there. One that was and is gone was moved or
+    /// deleted, and is never made again.
+    exists: bool,
+    /// Made with `create_new` (the torrent may not overwrite files).
+    create_new: bool,
+    /// The length `ensure_file_length` asked for before the file was made: given when it is.
+    len_when_made: Option<u64>,
     #[cfg(windows)]
     tried_marking_sparse: bool,
 }
 
-/// A file of the torrent, opened by the storage's `init`.
-///
-/// Its handle is closed when the torrent is paused ([`Self::close`]) and opened again on the
-/// next read or write, by the path it had: never created, so a file moved or deleted while the
-/// torrent was paused is an error rather than a new empty file written into as though it held
-/// the pieces.
+/// What the budget of open files ([`OpenFiles`]) sees of a file.
 #[derive(Debug)]
-pub(crate) struct OpenedFile {
+struct Shared {
+    entry: Entry,
     file: RwLock<OpenedFileLocked>,
     /// Written through since it was opened: written to disk before the handle closes.
     written: AtomicBool,
 }
 
-impl OpenedFile {
-    /// `read_only`: `f` can't write (see `FilesystemStorage::init`).
-    pub fn new(path: PathBuf, f: File, read_only: bool) -> Self {
-        Self {
-            file: RwLock::new(OpenedFileLocked {
-                path,
-                fd: Some(f),
-                read_only,
-                ..Default::default()
-            }),
-            written: AtomicBool::new(false),
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if self.file.get_mut().fd.is_some() {
+            self.entry.closed();
         }
     }
+}
 
-    pub fn new_dummy() -> Self {
-        Self {
-            file: RwLock::new(Default::default()),
-            written: AtomicBool::new(false),
+impl CachedHandle for Shared {
+    fn last_used(&self) -> u64 {
+        self.entry.last_used()
+    }
+
+    /// Closed by the budget: only when no read or write uses it, after writing what was
+    /// written through it to disk (as a pause does: the data is there before a bitfield that
+    /// claims it). If that fails the handle stays, and the error comes with the next close.
+    fn try_close(&self) -> bool {
+        let Some(mut g) = self.file.try_write() else {
+            return false;
+        };
+        let Some(fd) = g.fd.as_ref() else {
+            return false;
+        };
+        if self.written.swap(false, Ordering::AcqRel)
+            && let Err(e) = fd.sync_data()
+        {
+            self.written.store(true, Ordering::Release);
+            tracing::warn!(path=?g.path, error=?e, "error writing a file to disk; kept open");
+            return false;
         }
+        drop(g.fd.take());
+        self.entry.closed();
+        true
+    }
+}
+
+/// A file of the torrent.
+///
+/// Nothing is opened, nor made, by the storage's `init`. A read opens the file read-only; the
+/// first write opens it read/write, and makes it (and its folders) if it isn't there yet: a
+/// file nothing is written to, such as an unticked one that shares no piece with a ticked one,
+/// is never made. Handles are counted in a budget shared by the process ([`OpenFiles`]): the
+/// least recently used one is closed to open another, and opened again on its next use.
+///
+/// Its handle is also closed when the torrent is paused ([`Self::close`]). Opened again, a file
+/// that was there is never made again: a file moved or deleted meanwhile is an error rather than
+/// a new empty file written into as though it held the pieces.
+#[derive(Debug)]
+pub(crate) struct OpenedFile {
+    shared: Arc<Shared>,
+}
+
+impl OpenedFile {
+    /// A file at `path`, not opened yet. `exists`: it is there now. `create_new`: when it has to
+    /// be made, it must not be there (the torrent may not overwrite files).
+    pub fn lazy(path: PathBuf, exists: bool, create_new: bool, budget: &'static OpenFiles) -> Self {
+        Self::from_locked(
+            OpenedFileLocked {
+                path,
+                exists,
+                create_new,
+                ..Default::default()
+            },
+            budget,
+            false,
+        )
+    }
+
+    pub fn new_dummy(budget: &'static OpenFiles) -> Self {
+        Self::from_locked(Default::default(), budget, false)
+    }
+
+    fn from_locked(locked: OpenedFileLocked, budget: &'static OpenFiles, written: bool) -> Self {
+        let open = locked.fd.is_some();
+        let shared = Arc::new(Shared {
+            entry: Entry::new(budget),
+            file: RwLock::new(locked),
+            written: AtomicBool::new(written),
+        });
+        if open {
+            shared.entry.opened(&shared);
+        }
+        Self { shared }
     }
 
     /// Moves the file, handle and all, to a new OpenedFile and leaves this one useless: it
     /// never opens the file again. This is how a torrent's files go from one state to the next.
     pub fn take_clone(&self) -> anyhow::Result<Self> {
-        let f = std::mem::take(&mut *self.file.write());
-        Ok(Self {
-            file: RwLock::new(f),
-            written: AtomicBool::new(self.written.swap(false, Ordering::AcqRel)),
-        })
+        let mut g = self.shared.file.write();
+        let f = std::mem::take(&mut *g);
+        if f.fd.is_some() {
+            self.shared.entry.closed();
+        }
+        drop(g);
+        Ok(Self::from_locked(
+            f,
+            self.shared.entry.budget(),
+            self.shared.written.swap(false, Ordering::AcqRel),
+        ))
     }
 
-    /// The handle to read with, opened again if it was closed.
+    /// The handle to read with, opened (read-only) if there is none.
     pub fn for_read(&self) -> anyhow::Result<impl Deref<Target = File> + '_> {
         self.handle(false)
     }
 
-    /// A handle that can write: opened again (read/write) if it was closed or is read-only.
+    /// A handle that can write: opened again (read/write) if there is none or it is read-only;
+    /// the file is made if it isn't there yet.
     pub fn for_write(&self) -> anyhow::Result<impl Deref<Target = File> + '_> {
         let f = self.handle(true)?;
-        self.written.store(true, Ordering::Release);
+        self.shared.written.store(true, Ordering::Release);
         Ok(f)
+    }
+
+    /// `ensure_file_length`: the file is given that length. One not made yet gets it when it is
+    /// (its first write); an empty one is made now, as no write will ever come for it.
+    pub fn ensure_len(&self, len: u64) -> anyhow::Result<()> {
+        {
+            let mut g = self.shared.file.write();
+            if g.path.as_os_str().is_empty() {
+                return Err(Error::FsFileIsNone.into());
+            }
+            if !g.exists && len > 0 {
+                g.len_when_made = Some(len);
+                return Ok(());
+            }
+        }
+        Ok(self.for_write()?.set_len(len)?)
     }
 
     /// Writes what was written through the handle to disk and closes it (the torrent is
     /// paused). The next read or write opens the file again.
     pub fn close(&self) -> anyhow::Result<()> {
-        let mut g = self.file.write();
+        let mut g = self.shared.file.write();
         // Taking the lock for writing waited for every read and write still using the handle.
         let Some(fd) = g.fd.take() else {
             return Ok(());
         };
+        self.shared.entry.closed();
         let path = g.path.clone();
         drop(g);
-        if self.written.swap(false, Ordering::AcqRel) {
+        if self.shared.written.swap(false, Ordering::AcqRel) {
             fd.sync_data()
                 .with_context(|| format!("error writing {path:?} to disk"))?;
         }
@@ -231,7 +330,7 @@ impl OpenedFile {
     /// own app does, checking a seeded torrent's files again when one is ticked). Elsewhere an
     /// open file stops none of that, and the handle stays as it is.
     pub fn mark_finished(&self) -> anyhow::Result<()> {
-        let mut g = self.file.write();
+        let mut g = self.shared.file.write();
         if g.path.as_os_str().is_empty() {
             return Ok(());
         }
@@ -240,7 +339,7 @@ impl OpenedFile {
         if !g.read_only
             && let Some(fd) = g.fd.take()
         {
-            if self.written.swap(false, Ordering::AcqRel)
+            if self.shared.written.swap(false, Ordering::AcqRel)
                 && let Err(e) = fd.sync_data()
             {
                 g.fd = Some(fd);
@@ -263,19 +362,21 @@ impl OpenedFile {
     /// Whether a handle is open now.
     #[cfg(test)]
     pub fn is_open(&self) -> bool {
-        self.file.read().fd.is_some()
+        self.shared.file.read().fd.is_some()
     }
 
     /// The handle if it can do what is asked, otherwise one opened for it.
     fn handle(&self, write: bool) -> anyhow::Result<MappedRwLockReadGuard<'_, File>> {
-        let g = self.file.read();
+        let s = &self.shared;
+        s.entry.touch();
+        let g = s.file.read();
         let g = if g.usable(write) {
             g
         } else {
             drop(g);
-            let mut w = self.file.write();
+            let mut w = s.file.write();
             if !w.usable(write) {
-                w.prepare(write)?;
+                w.prepare(write, s)?;
             }
             RwLockWriteGuard::downgrade(w)
         };
@@ -299,38 +400,98 @@ impl OpenedFileLocked {
     }
 
     /// Makes the handle fit for what is asked, under the lock.
-    fn prepare(&mut self, write: bool) -> anyhow::Result<()> {
+    fn prepare(&mut self, write: bool, shared: &Arc<Shared>) -> anyhow::Result<()> {
         if self.fd.is_none() || (write && self.read_only) {
-            self.reopen(write)?;
+            self.reopen(write, shared)?;
         }
         #[cfg(windows)]
         if write && !self.tried_marking_sparse {
-            self.tried_marking_sparse = true;
-            if let Some(f) = self.fd.as_ref() {
-                let marked = super::sparse::mark_file_sparse(f);
-                tracing::debug!(path=?self.path, marked, "marking sparse");
-            }
+            self.mark_sparse();
         }
         Ok(())
     }
 
-    /// Opens the file again by its path. A finished file is opened read-only on Windows (see
-    /// [`OpenedFile::mark_finished`]) unless it is to be written; anything else read/write, as
-    /// `init` opened it.
-    fn reopen(&mut self, write: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    fn mark_sparse(&mut self) {
+        self.tried_marking_sparse = true;
+        if let Some(f) = self.fd.as_ref() {
+            let marked = super::sparse::mark_file_sparse(f);
+            tracing::debug!(path=?self.path, marked, "marking sparse");
+        }
+    }
+
+    /// Opens the file: read-only for a read, read/write for a write. A file that was there is
+    /// opened by its path, never made again; one never made is made by its first write, and a
+    /// read of it is an error (its pieces are missing).
+    fn reopen(&mut self, write: bool, shared: &Arc<Shared>) -> anyhow::Result<()> {
         if self.path.as_os_str().is_empty() {
             return Err(Error::FsFileIsNone.into());
         }
-        let read_only = !write && self.finished && cfg!(windows);
         // What this replaces, if anything, is a read-only handle: nothing to write to disk.
-        drop(self.fd.take());
-        self.fd = Some(open_existing(&self.path, read_only)?);
+        if self.fd.take().is_some() {
+            shared.entry.closed();
+        }
+        shared.entry.make_room();
+        let read_only = !write;
+        let fd = if self.exists {
+            open_existing(&self.path, read_only)?
+        } else if write {
+            let fd = make(&self.path, self.create_new)?;
+            self.exists = true;
+            self.fd = Some(fd);
+            #[cfg(windows)]
+            self.mark_sparse();
+            let fd = self.fd.take().expect("just set");
+            if let Some(len) = self.len_when_made.take() {
+                fd.set_len(len)
+                    .with_context(|| format!("error setting the length of {:?}", self.path))?;
+            }
+            fd
+        } else {
+            match std::fs::OpenOptions::new().read(true).open(&self.path) {
+                Ok(fd) => {
+                    // Put there by someone else since: it is the file from now on.
+                    self.exists = true;
+                    fd
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(e).with_context(|| {
+                        format!("{:?} isn't there: none of it was downloaded yet", self.path)
+                    });
+                }
+                Err(e) => return Err(e).with_context(|| format!("error opening {:?}", self.path)),
+            }
+        };
+        self.fd = Some(fd);
         self.read_only = read_only;
+        shared.entry.opened(shared);
         Ok(())
     }
 }
 
-/// Opens a file `init` made, without making it again.
+/// Makes a file of the torrent, its folders first, for its first write.
+fn make(path: &Path, create_new: bool) -> anyhow::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("error making the folder of {path:?}"))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(false);
+    }
+    options.open(path).with_context(|| {
+        if create_new {
+            format!("error creating a new file (because allow_overwrite = false) {path:?}")
+        } else {
+            format!("error opening {path:?} in read/write mode")
+        }
+    })
+}
+
+/// Opens a file that was there, without making it again.
 fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<File> {
     match std::fs::OpenOptions::new()
         .read(true)
@@ -339,7 +500,10 @@ fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<File> {
     {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e).with_context(|| {
-            format!("{path:?} is gone: it was moved or deleted while the torrent was paused")
+            format!("{path:?} is gone: it was moved or deleted")
+        }),
+        Err(e) if !read_only && is_sharing_violation(&e) => Err(e).with_context(|| {
+            format!("{path:?} can't be written: another program holds it")
         }),
         Err(e) => Err(e).with_context(|| format!("error opening {path:?} again")),
     }
@@ -387,20 +551,19 @@ mod tests {
     use peer_binary_protocol::DoubleBufHelper;
     use tempfile::TempDir;
 
-    use crate::storage::filesystem::opened_file::OurFileExt;
+    use crate::storage::filesystem::{open_files::OpenFiles, opened_file::OurFileExt};
 
     use super::OpenedFile;
     use crate::tests::test_util::held;
 
+    /// A budget of this test's own: other tests' files never close these.
+    fn budget(max: usize) -> &'static OpenFiles {
+        Box::leak(Box::new(OpenFiles::new(max)))
+    }
+
     fn opened(dir: &TempDir, name: &str, bytes: &[u8]) -> (std::path::PathBuf, OpenedFile) {
         let path = dir.path().join(name);
-        let f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let file = OpenedFile::new(path.clone(), f, false);
+        let file = OpenedFile::lazy(path.clone(), false, true, budget(64));
         file.for_write().unwrap().pwrite_all(0, bytes).unwrap();
         (path, file)
     }
@@ -409,6 +572,107 @@ mod tests {
         let mut buf = vec![0u8; len];
         file.for_read().unwrap().pread_exact(0, &mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn test_a_file_is_made_by_its_first_write_only() {
+        let td = TempDir::with_prefix("test_made_by_first_write").unwrap();
+        let path = td.path().join("sub").join("dir").join("a");
+        let file = OpenedFile::lazy(path.clone(), false, false, budget(64));
+        // Read: an error, and nothing made, not even its folder.
+        let e = format!("{:#}", file.for_read().err().unwrap());
+        assert!(e.contains("none of it was downloaded"), "{e}");
+        assert!(!td.path().join("sub").exists());
+        // Its length asked for: still nothing made.
+        file.ensure_len(10).unwrap();
+        assert!(!path.exists());
+        // The first write makes it, with its folders and that length.
+        file.for_write().unwrap().pwrite_all(2, b"hi").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\0\0hi\0\0\0\0\0\0");
+        file.close().unwrap();
+    }
+
+    #[test]
+    fn test_an_empty_file_is_made_when_its_length_is_asked() {
+        let td = TempDir::with_prefix("test_empty_made").unwrap();
+        let path = td.path().join("empty");
+        let file = OpenedFile::lazy(path.clone(), false, false, budget(64));
+        file.ensure_len(0).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_reads_open_read_only_and_a_write_reopens() {
+        let td = TempDir::with_prefix("test_reads_read_only").unwrap();
+        let path = td.path().join("a");
+        std::fs::write(&path, b"hello").unwrap();
+        let file = OpenedFile::lazy(path.clone(), true, false, budget(64));
+        assert!(!file.is_open(), "nothing opened before it is used");
+        assert_eq!(read(&file, 5), b"hello");
+        assert!(file.shared.file.read().read_only);
+        assert!(file.for_read().unwrap().pwrite_all(0, b"x").is_err());
+        file.for_write().unwrap().pwrite_all(0, b"J").unwrap();
+        file.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"Jello");
+    }
+
+    #[test]
+    fn test_allow_overwrite_off_never_writes_into_a_file_put_there() {
+        let td = TempDir::with_prefix("test_create_new").unwrap();
+        let path = td.path().join("a");
+        let file = OpenedFile::lazy(path.clone(), false, true, budget(64));
+        std::fs::write(&path, b"theirs").unwrap();
+        assert!(file.for_write().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn test_the_budget_closes_the_least_recently_used_after_syncing_it() {
+        let td = TempDir::with_prefix("test_budget_closes").unwrap();
+        let budget = budget(4);
+        let files: Vec<_> = (0..20)
+            .map(|i| {
+                let f = OpenedFile::lazy(td.path().join(i.to_string()), false, false, budget);
+                f.for_write()
+                    .unwrap()
+                    .pwrite_all(0, i.to_string().as_bytes())
+                    .unwrap();
+                assert!(budget.open_count() <= 4, "{}", budget.open_count());
+                f
+            })
+            .collect();
+        assert_eq!(files.iter().filter(|f| f.is_open()).count(), 4);
+        assert!(files[16..].iter().all(|f| f.is_open()), "the latest stay open");
+        // Closed by the budget: what was written was written to disk first.
+        assert!(
+            files[..16]
+                .iter()
+                .all(|f| !f.shared.written.load(super::Ordering::Acquire))
+        );
+        // And each opens again where it is, with its bytes.
+        for (i, f) in files.iter().enumerate() {
+            let want = i.to_string();
+            assert_eq!(read(f, want.len()), want.as_bytes());
+            assert!(budget.open_count() <= 4);
+        }
+        drop(files);
+        assert_eq!(budget.open_count(), 0, "dropped files leave the budget");
+    }
+
+    #[test]
+    fn test_a_file_in_use_is_not_closed_by_the_budget() {
+        let td = TempDir::with_prefix("test_in_use").unwrap();
+        let budget = budget(1);
+        let a = OpenedFile::lazy(td.path().join("a"), false, false, budget);
+        let b = OpenedFile::lazy(td.path().join("b"), false, false, budget);
+        let held_a = a.for_write().unwrap();
+        held_a.pwrite_all(0, b"a").unwrap();
+        // b needs a handle while a's is in use: b goes over the budget, a keeps its handle.
+        b.for_write().unwrap().pwrite_all(0, b"b").unwrap();
+        held_a.pwrite_all(1, b"a").unwrap();
+        drop(held_a);
+        assert!(a.is_open() && b.is_open());
+        assert_eq!(budget.open_count(), 2);
     }
 
     #[test]
@@ -441,7 +705,7 @@ mod tests {
         assert!(!file.is_open());
         assert_eq!(read(&taken, 5), b"hello");
         // What was written before the move is still written to disk when the new one closes.
-        assert!(taken.written.load(super::Ordering::Acquire));
+        assert!(taken.shared.written.load(super::Ordering::Acquire));
     }
 
     #[test]

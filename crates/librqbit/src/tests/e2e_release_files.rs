@@ -113,7 +113,7 @@ async fn test_paused_torrent_holds_no_file_and_resumes() -> anyhow::Result<()> {
     run(async {
         let seed = start_seeder(SeederOpts::default()).await?;
         let client = client(&seed).await?;
-        assert_ne!(held(&client.file), Some(false), "open while it downloads");
+        assert!(!client.file.exists(), "not made before its first byte");
 
         serve(&client, &seed, 0b1110_0000, &[0, 1, 2]).await?;
         client.session.pause(&client.handle).await?;
