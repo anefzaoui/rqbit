@@ -62,7 +62,10 @@ fn options(budget: &'static OpenFiles, listen: bool) -> SessionOptions {
 }
 
 /// A seeder of `src` (a folder of the torrent's files) on loopback: its torrent and address.
-async fn seed(src: &Path, budget: &'static OpenFiles) -> anyhow::Result<(Arc<Session>, Bytes, SocketAddr)> {
+async fn seed(
+    src: &Path,
+    budget: &'static OpenFiles,
+) -> anyhow::Result<(Arc<Session>, Bytes, SocketAddr)> {
     let made = crate::create_torrent(
         src,
         CreateTorrentOptions {
@@ -73,7 +76,8 @@ async fn seed(src: &Path, budget: &'static OpenFiles) -> anyhow::Result<(Arc<Ses
     )
     .await?;
     let torrent = made.as_bytes()?;
-    let seeder = Session::new_with_opts(src.parent().unwrap().to_owned(), options(budget, true)).await?;
+    let seeder =
+        Session::new_with_opts(src.parent().unwrap().to_owned(), options(budget, true)).await?;
     let handle = seeder
         .add_torrent(
             AddTorrent::TorrentFileBytes(torrent.clone()),
@@ -138,7 +142,9 @@ fn listing(dir: &Path) -> Vec<String> {
 }
 
 fn bytes(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
 // Only c.bin ticked. Its first piece starts in a.bin and takes all of b.txt, its last piece
@@ -292,18 +298,29 @@ async fn test_many_tiny_files_stay_within_the_budget() -> anyhow::Result<()> {
     .context("timed out")?
 }
 
-/// Linux: how many of the process's descriptors are files under `dir`.
+/// Linux: how many of the process's descriptors are files under `dir`. Only those in two
+/// listings of `/proc/self/fd` in a row: one listing isn't taken at one instant, and counts a
+/// file closed and another opened while it is read.
 fn fds_under(dir: &Path) -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
         let dir = std::fs::canonicalize(dir).ok()?;
-        Some(
-            std::fs::read_dir("/proc/self/fd")
-                .ok()?
-                .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-                .filter(|p| p.starts_with(&dir))
-                .count(),
-        )
+        let listing =
+            || -> Option<std::collections::HashSet<(std::ffi::OsString, std::path::PathBuf)>> {
+                Some(
+                    std::fs::read_dir("/proc/self/fd")
+                        .ok()?
+                        .filter_map(|e| {
+                            let e = e.ok()?;
+                            let to = std::fs::read_link(e.path()).ok()?;
+                            to.starts_with(&dir).then(|| (e.file_name(), to))
+                        })
+                        .collect(),
+                )
+            };
+        let first = listing()?;
+        let second = listing()?;
+        Some(first.intersection(&second).count())
     }
     #[cfg(not(target_os = "linux"))]
     {

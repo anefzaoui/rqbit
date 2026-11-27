@@ -139,7 +139,6 @@ fn pwrite_all_unvectored(
     Ok(bufs[0].len() + bufs[1].len())
 }
 
-
 /// What an [`OpenedFile`] holds. The path stays when the handle is closed, so that the file can
 /// be opened again; an empty path is padding, or what [`OpenedFile::take_clone`] left behind,
 /// which never opens anything.
@@ -293,8 +292,7 @@ impl OpenedFile {
                 return Ok(());
             }
             // As long already (a torrent resumed, or seeded): nothing to open or write.
-            if g.exists && std::fs::metadata(&g.path).is_ok_and(|m| m.is_file() && m.len() == len)
-            {
+            if g.exists && std::fs::metadata(&g.path).is_ok_and(|m| m.is_file() && m.len() == len) {
                 return Ok(());
             }
         }
@@ -532,12 +530,12 @@ fn open_existing(path: &Path, read_only: bool) -> anyhow::Result<File> {
         .open(path)
     {
         Ok(f) => Ok(f),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(e).with_context(|| {
-            format!("{path:?} is gone: it was moved or deleted")
-        }),
-        Err(e) if !read_only && is_sharing_violation(&e) => Err(e).with_context(|| {
-            format!("{path:?} can't be written: another program holds it")
-        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("{path:?} is gone: it was moved or deleted"))
+        }
+        Err(e) if !read_only && is_sharing_violation(&e) => {
+            Err(e).with_context(|| format!("{path:?} can't be written: another program holds it"))
+        }
         Err(e) => Err(e).with_context(|| format!("error opening {path:?} again")),
     }
 }
@@ -688,7 +686,10 @@ mod tests {
             })
             .collect();
         assert_eq!(files.iter().filter(|f| f.is_open()).count(), 4);
-        assert!(files[16..].iter().all(|f| f.is_open()), "the latest stay open");
+        assert!(
+            files[16..].iter().all(|f| f.is_open()),
+            "the latest stay open"
+        );
         // Closed by the budget, still to be written to disk: a pause does it, opening each
         // again for that, and leaves it closed.
         let written = |f: &OpenedFile| f.shared.written.load(super::Ordering::Acquire);

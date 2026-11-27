@@ -310,7 +310,11 @@ mod tests {
         assert_eq!(files.iter().filter(|f| *f.open.read()).count(), 8);
         // The last ones opened are the ones still open; the others were closed.
         assert!(files[92..].iter().all(|f| *f.open.read()));
-        assert!(files[..92].iter().all(|f| f.closed_once.load(Ordering::Relaxed)));
+        assert!(
+            files[..92]
+                .iter()
+                .all(|f| f.closed_once.load(Ordering::Relaxed))
+        );
     }
 
     #[test]
