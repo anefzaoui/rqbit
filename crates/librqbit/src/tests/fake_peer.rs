@@ -322,6 +322,9 @@ impl Fixture {
 #[derive(Default)]
 pub(super) struct SeederOpts {
     pub(super) upload_bps: Option<u32>,
+    /// The torrent's content in this many files of the same length (0: one), each a whole
+    /// number of pieces when PIECES divides by it.
+    pub(super) files: usize,
 }
 
 fn loopback_listener() -> ListenerOptions {
@@ -332,9 +335,14 @@ fn loopback_listener() -> ListenerOptions {
     }
 }
 
-/// A session listening on loopback that has the whole (one file) torrent.
+/// A session listening on loopback that has the whole torrent (one file, or `opts.files`).
 pub(super) async fn start_seeder(opts: SeederOpts) -> anyhow::Result<Fixture> {
-    let dir = create_default_random_dir_with_torrents(1, FILE_LEN, Some("rqbit_fake_peer_seed"));
+    let files = opts.files.max(1);
+    let dir = create_default_random_dir_with_torrents(
+        files,
+        FILE_LEN / files,
+        Some("rqbit_fake_peer_seed"),
+    );
     let torrent = create_torrent(
         dir.path(),
         CreateTorrentOptions {
@@ -345,7 +353,11 @@ pub(super) async fn start_seeder(opts: SeederOpts) -> anyhow::Result<Fixture> {
         &BlockingSpawner::new(1),
     )
     .await?;
-    let content = std::fs::read(dir.path().join("0.data"))?;
+    // In torrent order: a torrent made from a folder lists its files by name.
+    let mut content = Vec::new();
+    for i in 0..files {
+        content.extend(std::fs::read(dir.path().join(format!("{i}.data")))?);
+    }
     let torrent_bytes = torrent.as_bytes()?;
     let session = Session::new_with_opts(
         dir.path().into(),

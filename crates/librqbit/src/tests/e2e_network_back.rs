@@ -97,6 +97,7 @@ impl Network {
 async fn swarm() -> anyhow::Result<(Fixture, Network, Vec<Link>, Fixture)> {
     let seed = start_seeder(SeederOpts {
         upload_bps: Some(16 * 1024),
+        ..Default::default()
     })
     .await?;
     let net = Network::new();

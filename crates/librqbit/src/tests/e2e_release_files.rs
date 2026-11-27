@@ -28,7 +28,9 @@ use crate::{
 struct Client {
     session: Arc<Session>,
     handle: ManagedTorrentHandle,
+    /// Its first file.
     file: PathBuf,
+    files: Vec<PathBuf>,
     _dir: TempDir,
 }
 
@@ -58,15 +60,17 @@ async fn client(seed: &Fixture) -> anyhow::Result<Client> {
         .into_handle()
         .context("into_handle")?;
     handle.wait_until_initialized().await?;
-    let file = handle.with_metadata(|m| {
-        handle
-            .output_folder()
-            .join(&m.file_infos[0].relative_filename)
+    let files = handle.with_metadata(|m| {
+        m.file_infos
+            .iter()
+            .map(|fi| handle.output_folder().join(&fi.relative_filename))
+            .collect::<Vec<_>>()
     })?;
     Ok(Client {
         session,
         handle,
-        file,
+        file: files[0].clone(),
+        files,
         _dir: dir,
     })
 }
@@ -228,6 +232,43 @@ async fn test_finished_file_is_shared_while_seeding() -> anyhow::Result<()> {
                 .open(&client.file)
                 .is_err(),
             "no writer while it is seeded"
+        );
+        client.session.delete(id(&client), false).await?;
+        Ok(())
+    })
+    .await
+}
+
+// Two files, the first ending where a piece starts. Finished, it was moved away while the
+// torrent was paused: the second file's pieces never touch it (reading or writing it for 0
+// bytes opened it again, and found it gone), and the torrent finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_next_files_pieces_leave_a_finished_file_alone() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder(SeederOpts {
+            files: 2,
+            ..Default::default()
+        })
+        .await?;
+        let client = client(&seed).await?;
+        assert_eq!(client.files.len(), 2);
+        let half = (super::fake_peer::PIECE_LEN * PIECES / 2) as usize;
+
+        serve(&client, &seed, 0b1100_0000, &[0, 1]).await?;
+        client.session.pause(&client.handle).await?;
+        let moved = client.file.with_extension("moved");
+        std::fs::rename(&client.file, &moved)?;
+
+        client.session.unpause(&client.handle).await?;
+        let _ = serve(&client, &seed, 0b0011_0000, &[2, 3]).await;
+        client.handle.wait_until_completed().await?;
+        let stats = client.handle.stats();
+        assert!(stats.error.is_none(), "{stats}");
+        assert_eq!(std::fs::read(&client.files[1])?, seed.content[half..]);
+        assert_eq!(std::fs::read(&moved)?, seed.content[..half]);
+        assert!(
+            !client.file.exists(),
+            "nothing made where the first file was"
         );
         client.session.delete(id(&client), false).await?;
         Ok(())
