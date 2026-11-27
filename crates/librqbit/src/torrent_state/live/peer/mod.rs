@@ -30,6 +30,10 @@ pub(crate) struct Peer {
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     pub outgoing_address: Option<SocketAddr>,
+    // Bumped each time a reconnect of this peer is scheduled (a backoff wait after it died,
+    // or a dial at once after a network change): a wait that ends after a newer one was
+    // scheduled finds another number and dials nothing, so one peer has one pending dial.
+    pub reconnect_generation: u64,
 }
 
 impl Peer {
@@ -49,6 +53,7 @@ impl Peer {
             state,
             stats: Default::default(),
             outgoing_address: None,
+            reconnect_generation: 0,
         }
     }
 
@@ -58,6 +63,7 @@ impl Peer {
             outgoing_address: Some(addr),
             stats: Default::default(),
             state: Default::default(),
+            reconnect_generation: 0,
         }
     }
 

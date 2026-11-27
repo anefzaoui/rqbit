@@ -938,6 +938,37 @@ impl TorrentStateLive {
         }
     }
 
+    /// The network came back (`Session::network_changed`): every peer that died and waits for
+    /// its reconnect backoff is dialed again now, once, its backoff started afresh. While the
+    /// network was gone each try failed and the waits grew (10 s, then x6 up to an hour), and
+    /// the trackers and the DHT naming those peers again don't bring them back: a known peer
+    /// isn't queued twice. A finished torrent dials nothing. Returns how many were queued.
+    pub(crate) fn reconnect_dead_peers(&self) -> usize {
+        // Before the peer table is touched: the state lock is never taken while holding it.
+        if self.is_finished_and_no_active_streams() {
+            return 0;
+        }
+        let mut queued = Vec::new();
+        for mut pe in self.peers.states.iter_mut() {
+            let addr = *pe.key();
+            let peer = pe.value_mut();
+            // Peers that came to us (no outgoing address) are never dialed, as before.
+            if !matches!(peer.get_state(), PeerState::Dead) || peer.outgoing_address != Some(addr) {
+                continue;
+            }
+            peer.stats.reset_backoff();
+            peer.reconnect_generation = peer.reconnect_generation.wrapping_add(1);
+            peer.set_state(PeerState::Queued, &self.peers);
+            queued.push(addr);
+        }
+        for addr in &queued {
+            if self.peer_queue_tx.send(*addr).is_err() {
+                break;
+            }
+        }
+        queued.len()
+    }
+
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
         self.peers
             .states
@@ -1388,6 +1419,11 @@ impl PeerHandler {
         }
 
         let backoff = pe.value_mut().stats.backoff.next();
+        let generation = {
+            let peer = pe.value_mut();
+            peer.reconnect_generation = peer.reconnect_generation.wrapping_add(1);
+            peer.reconnect_generation
+        };
 
         // Prevent deadlocks.
         drop(pe);
@@ -1413,9 +1449,15 @@ impl PeerHandler {
                         .peers
                         .with_peer_mut(handle, "dead_to_queued", |peer| {
                             match peer.get_state() {
-                                PeerState::Dead => {
+                                PeerState::Dead if peer.reconnect_generation == generation => {
                                     peer.set_state(PeerState::Queued, &self.state.peers);
                                     true
+                                }
+                                // Dialed again since (a network change) and died again: that
+                                // death scheduled its own wait.
+                                PeerState::Dead => {
+                                    trace!("a newer reconnect is scheduled, skipping this one");
+                                    false
                                 }
                                 // Peer reconnected (e.g. via incoming connection) while we were
                                 // waiting. No need to queue - it's already connected or queued.

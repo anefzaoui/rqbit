@@ -8,7 +8,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -153,9 +153,18 @@ pub struct Session {
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
 
-    // Bumped when the network came back: the trackers watch it.
+    // Bumped by `network_changed`: the trackers (and the magnet lookups) watch it.
     network: tokio::sync::watch::Sender<u64>,
+    // When `network_changed` last acted.
+    last_network_change: parking_lot::Mutex<Option<Instant>>,
 }
+
+/// `Session::network_changed` acts at most once in this long. Wi-Fi roaming between access
+/// points or a DHCP renewal can change the address twice in a few seconds; each change would
+/// dial every dead peer of every torrent again. A peer whose dial failed after a change waits
+/// 10-20 s (its fresh backoff) for its next try anyway, so a second change this soon adds
+/// nothing.
+pub const NETWORK_CHANGE_MIN_GAP: Duration = Duration::from_secs(15);
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
 /// also matches URLs that happen to be 40 characters long, such as
@@ -956,6 +965,7 @@ impl Session {
                 allowlist,
                 lsd,
                 network: tokio::sync::watch::Sender::new(0),
+                last_network_change: parking_lot::Mutex::new(None),
             });
 
             if let Some(mut listen) = listen_result {
@@ -1267,6 +1277,50 @@ impl Session {
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    /// The network came back or changed: a new local address (Wi-Fi reconnected, another
+    /// network, a VPN switched), a wake from sleep, or answers again after an outage. Peers
+    /// known from before are in their reconnect backoff (up to an hour after a few failed
+    /// tries) and a torrent that had peers would wait that long. Now every torrent that wants
+    /// data dials its dead peers again, once, each with its backoff started afresh; every
+    /// tracker is asked again (not sooner than its `min interval` after its last answer); and
+    /// every DHT lookup asks its nodes again.
+    ///
+    /// For a client that hears of a change from the system. A call within
+    /// [`NETWORK_CHANGE_MIN_GAP`] of the last one that acted does nothing. Returns whether it
+    /// acted.
+    pub fn network_changed(&self) -> bool {
+        {
+            let mut last = self.last_network_change.lock();
+            let now = Instant::now();
+            if last.is_some_and(|t| now.duration_since(t) < NETWORK_CHANGE_MIN_GAP) {
+                debug!("network changed again too soon, nothing done");
+                return false;
+            }
+            *last = Some(now);
+        }
+        self.network.send_modify(|n| *n = n.wrapping_add(1));
+        if let Some(dht) = &self.dht {
+            dht.requery_now();
+        }
+        let torrents = self
+            .db
+            .read()
+            .torrents
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let peers: usize = torrents
+            .iter()
+            .filter_map(|t| t.live())
+            .map(|live| live.reconnect_dead_peers())
+            .sum();
+        info!(
+            dead_peers_dialed = peers,
+            "network changed: dialing dead peers again, asking trackers and the DHT again"
+        );
+        true
     }
 
     /// Run a callback given the currently managed torrents.

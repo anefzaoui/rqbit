@@ -96,8 +96,8 @@ pub use peer_connection::PeerConnectionOptions;
 pub use piece_order::PieceOrder;
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConfigureHttpClient, DhtSessionConfig,
-    ListOnlyResponse, PeerFilter, SUPPORTED_SCHEMES, Session, SessionOptions,
-    SessionPersistenceConfig,
+    ListOnlyResponse, NETWORK_CHANGE_MIN_GAP, PeerFilter, SUPPORTED_SCHEMES, Session,
+    SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
