@@ -563,6 +563,14 @@ pub struct SessionOptions {
     /// One it refuses is sent nothing. HTTP trackers' addresses are the HTTP client's to check
     /// (`configure_http_client`: a DNS resolver, a redirect policy). None: every address.
     pub udp_tracker_filter: Option<UdpTrackerAddrFilter>,
+
+    /// No watcher for the network coming back. By default the session looks every 2 seconds
+    /// for a new local address (Wi-Fi reconnected, another network, a VPN), a wake from
+    /// sleep, and its DHT answering again after an outage, and then calls
+    /// [`Session::network_changed`]: without it, a torrent whose peers all died with the
+    /// network waits out their reconnect backoff (up to an hour) after it is back. Off for a
+    /// client that calls `network_changed` itself from the system's own signal.
+    pub disable_network_watch: bool,
 }
 
 impl Default for SessionOptions {
@@ -597,6 +605,7 @@ impl Default for SessionOptions {
             peer_filter: None,
             udp_tracker_filter: None,
             configure_upnp_http_client: None,
+            disable_network_watch: false,
         }
     }
 }
@@ -1054,6 +1063,14 @@ impl Session {
 
             session.start_speed_estimator_updater();
 
+            if !opts.disable_network_watch {
+                session.spawn(
+                    debug_span!(parent: session.rs(), "network_watch"),
+                    "network_watch",
+                    crate::net_watch::watch(Arc::downgrade(&session), opts.bind_ip),
+                );
+            }
+
             Ok(session)
         }
         .boxed()
@@ -1287,7 +1304,8 @@ impl Session {
     /// tracker is asked again (not sooner than its `min interval` after its last answer); and
     /// every DHT lookup asks its nodes again.
     ///
-    /// For a client that hears of a change from the system. A call within
+    /// The session's own watcher calls it (`SessionOptions::disable_network_watch`); a client
+    /// that hears of a change from the system may call it too. A call within
     /// [`NETWORK_CHANGE_MIN_GAP`] of the last one that acted does nothing. Returns whether it
     /// acted.
     pub fn network_changed(&self) -> bool {
