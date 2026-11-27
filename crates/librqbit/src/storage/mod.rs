@@ -180,6 +180,27 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// The torrent is paused: nothing reads or writes its files until it starts again. A
+    /// storage that holds files open writes what it holds to disk and closes them here, so
+    /// that a paused torrent keeps no file in use; its next read or write opens them again.
+    /// Opened again, a file that was moved or deleted meanwhile is an error, never a new empty
+    /// one. Not called when a torrent only moves between states (see [`Self::take`]).
+    ///
+    /// Default implementation does nothing: the storage keeps what it holds.
+    fn close_files(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Every piece of file `file_id` is downloaded and verified: from now on it is only read,
+    /// for seeding. Called once when the piece that completes it is verified, and again for each
+    /// complete file whenever the torrent starts. A storage may hold the file read-only from
+    /// now on.
+    ///
+    /// Default implementation does nothing.
+    fn on_file_completed(&self, _file_id: usize) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -226,6 +247,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn close_files(&self) -> anyhow::Result<()> {
+        (**self).close_files()
+    }
+
+    fn on_file_completed(&self, file_id: usize) -> anyhow::Result<()> {
+        (**self).on_file_completed(file_id)
     }
 }
 

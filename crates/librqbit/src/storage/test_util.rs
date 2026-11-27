@@ -30,6 +30,10 @@ pub(crate) fn piece(id: u32) -> ValidPieceIndex {
 pub(crate) struct Probe {
     /// The pieces on_piece_completed() was called for, in order.
     pub completed: Mutex<Vec<u32>>,
+    /// How many times close_files() was called.
+    pub closed: Mutex<u32>,
+    /// The files on_file_completed() was called for, in order.
+    pub files_completed: Mutex<Vec<usize>>,
 }
 
 impl TorrentStorage for Probe {
@@ -69,6 +73,16 @@ impl TorrentStorage for Probe {
         self.completed.lock().push(piece_index.get());
         Ok(())
     }
+
+    fn close_files(&self) -> anyhow::Result<()> {
+        *self.closed.lock() += 1;
+        Ok(())
+    }
+
+    fn on_file_completed(&self, file_id: usize) -> anyhow::Result<()> {
+        self.files_completed.lock().push(file_id);
+        Ok(())
+    }
 }
 
 // Everything a wrapper has to pass through to the storage it wraps and can't decide on
@@ -80,5 +94,17 @@ pub(crate) fn assert_forwards_defaults<S: TorrentStorage>(storage: &S, probe: &P
         vec![1],
         "on_piece_completed() didn't reach the storage: a store that makes a piece \
          visible there never gets told"
+    );
+    storage.close_files().unwrap();
+    assert_eq!(
+        *probe.closed.lock(),
+        1,
+        "close_files() didn't reach the storage: a paused torrent keeps its files open"
+    );
+    storage.on_file_completed(3).unwrap();
+    assert_eq!(
+        *probe.files_completed.lock(),
+        vec![3],
+        "on_file_completed() didn't reach the storage: a finished file stays open for writing"
     );
 }

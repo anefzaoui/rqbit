@@ -133,6 +133,14 @@ impl<U: TorrentStorage> TorrentStorage for SlowStorage<U> {
     fn on_piece_completed(&self, piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         self.underlying.on_piece_completed(piece_index)
     }
+
+    fn close_files(&self) -> anyhow::Result<()> {
+        self.underlying.close_files()
+    }
+
+    fn on_file_completed(&self, file_id: usize) -> anyhow::Result<()> {
+        self.underlying.on_file_completed(file_id)
+    }
 }
 
 #[cfg(test)]
