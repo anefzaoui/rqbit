@@ -254,6 +254,15 @@ impl TorrentStateLive {
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
+        // The files already complete, for the storage (see on_file_completed below).
+        let completed_files: Vec<usize> = paused
+            .metadata
+            .file_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, fi)| !fi.attrs.padding && paused.chunk_tracker.is_file_finished(fi))
+            .map(|(file_id, _)| file_id)
+            .collect();
 
         // TODO: make it configurable
         let file_priorities = {
@@ -320,6 +329,14 @@ impl TorrentStateLive {
             ratelimit_upload_tx,
             ratelimits,
         });
+
+        // The files it already has, as if their last piece came in now: the storage may hold
+        // them read-only while they are seeded (TorrentStorage::on_file_completed).
+        for file_id in completed_files {
+            if let Err(e) = state.files.on_file_completed(file_id) {
+                warn!(id=state.shared.id, info_hash=?state.shared.info_hash, file_id, "storage errored in on_file_completed(): {e:#}");
+            }
+        }
 
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "speed_estimator_updater"),
@@ -821,6 +838,14 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
+        // A paused torrent keeps no file open (TorrentStorage::close_files): what was written
+        // goes to disk and the files are closed, to be opened again when it starts. Before the
+        // bitfield below, so that it never says we have a piece whose data is not on disk yet.
+        let files = self.files.take()?;
+        if let Err(e) = files.close_files() {
+            warn!(id=self.shared.id, info_hash=?self.shared.info_hash, "error closing the files of a paused torrent: {e:#}");
+        }
+
         // Pieces verified since the last periodic flush are only in memory.
         // Save them now, so a restart doesn't download them again.
         g.try_flush_bitv(&self.shared, false);
@@ -835,7 +860,7 @@ impl TorrentStateLive {
         Ok(TorrentStatePaused {
             shared: self.shared.clone(),
             metadata: self.metadata.clone(),
-            files: self.files.take()?,
+            files,
             chunk_tracker,
             streams: self.streams.clone(),
         })
@@ -908,20 +933,41 @@ impl TorrentStateLive {
         }
 
         let chunks = locked.get_chunks()?;
-        if chunks.is_finished() {
+        // The files this piece completes: the storage hears about them below, once the lock is
+        // released.
+        let completed_files: Vec<usize> = self
+            .metadata
+            .file_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, fi)| {
+                fi.piece_range.contains(&id.get())
+                    && !fi.attrs.padding
+                    && chunks.is_file_finished(fi)
+            })
+            .map(|(file_id, _)| file_id)
+            .collect();
+        let finished = chunks.is_finished();
+        if finished {
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
             }
             self.finished_notify.notify_waiters();
+        }
+        let disconnect_peers = finished && !self.has_active_streams_unfinished_files(locked);
+        // What follows takes other locks: this one is released first, to prevent deadlocks.
+        drop(g);
 
-            if !self.has_active_streams_unfinished_files(locked) {
-                // prevent deadlocks.
-                drop(g);
-                // There is not point being connected to peers that have all the torrent, when
-                // we don't need anything from them, and they don't need anything from us.
-                self.disconnect_all_peers_that_have_full_torrent();
+        for file_id in completed_files {
+            if let Err(e) = self.files.on_file_completed(file_id) {
+                warn!(id=self.shared.id, info_hash=?self.shared.info_hash, file_id, "storage errored in on_file_completed(): {e:#}");
             }
+        }
+        if disconnect_peers {
+            // There is not point being connected to peers that have all the torrent, when
+            // we don't need anything from them, and they don't need anything from us.
+            self.disconnect_all_peers_that_have_full_torrent();
         }
         Ok(())
     }

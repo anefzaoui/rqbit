@@ -6,6 +6,7 @@ mod e2e_network_back;
 mod e2e_padded_files;
 mod e2e_pause_bitv;
 mod e2e_pause_during_check;
+mod e2e_release_files;
 mod e2e_stream;
 mod fake_peer;
 mod http_client_hook;

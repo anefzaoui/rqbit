@@ -415,6 +415,17 @@ impl ManagedTorrent {
                                 .context("bug: concurrent init semaphore was closed")?;
 
                             let check_result = init.check().await;
+                            // A check stopped half-way by a pause keeps its storage for when it
+                            // starts again; meanwhile its files are closed, as a paused torrent's
+                            // are (TorrentStorage::close_files). Before the check counts as
+                            // ended: a start meanwhile finds it busy, and the restart below
+                            // picks it up.
+                            if check_result.is_err()
+                                && init.is_pause_requested()
+                                && let Err(e) = init.files.close_files()
+                            {
+                                warn!(?e, "error closing the files of a paused check");
+                            }
                             init.finish_check();
 
                             match check_result {
@@ -478,8 +489,13 @@ impl ManagedTorrent {
                     );
                     Ok(())
                 }
-                ManagedTorrentState::Paused(_) => {
+                ManagedTorrentState::Paused(paused) => {
                     if start_paused {
+                        // It rests paused (added paused, or its check ended with a pause
+                        // asked for): its files are closed until it starts.
+                        if let Err(e) = paused.files.close_files() {
+                            warn!(?e, "error closing the files of a paused torrent");
+                        }
                         return Ok(());
                     }
                     let paused = g.state.take().assert_paused();
