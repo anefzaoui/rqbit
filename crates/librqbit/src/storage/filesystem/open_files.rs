@@ -13,7 +13,8 @@
 //! it is still written to disk when its torrent is paused, as before.
 //!
 //! Locks: a file's own lock may be held while the registry's is taken, never the other way
-//! round (the registry only *tries* a file's lock, from outside its own).
+//! round (the registry only *tries* a file's lock, from outside its own). A handle being opened
+//! is counted in first ([`OpenFiles::admit`]), so two opening at once never pass the budget.
 
 use std::{
     collections::HashMap,
@@ -115,9 +116,13 @@ impl OpenFiles {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Before a handle is opened (by `except`, which is never closed for it): closes the least
-    /// recently used ones until there is room for it. Busy ones are passed over.
-    pub fn make_room(&self, except: u64) {
+    /// Before a handle is opened: counts it in (`id`, `handle`), first closing the least
+    /// recently used ones until there is room for it. Busy ones are passed over. Room is found
+    /// and taken under one lock, so that two opening at once can't both take the last place.
+    /// If the open then fails, [`Self::closed`] gives the place back.
+    pub fn admit(&self, id: u64, handle: Weak<dyn CachedHandle>) {
+        let mut handle = Some(handle);
+        let mut tried = false;
         loop {
             // The handles are only upgraded under the lock, and dropped after it: the last
             // reference to one going away runs its drop, which tells the registry.
@@ -125,24 +130,25 @@ impl OpenFiles {
                 let mut open = self.open.lock();
                 open.retain(|_, h| h.strong_count() > 0);
                 let max = self.max();
-                let mine = usize::from(open.contains_key(&except));
+                let mine = usize::from(open.contains_key(&id));
                 // Room for one more (this one, unless it is counted already).
                 let excess = (open.len() - mine + 1).saturating_sub(max);
-                if excess == 0 {
+                if excess == 0 || tried {
+                    // Room, or every one tried was busy: over the budget for now.
+                    if let Some(h) = handle.take() {
+                        open.insert(id, h);
+                    }
                     return;
                 }
                 let all: Vec<Arc<dyn CachedHandle>> = open
                     .iter()
-                    .filter(|(id, _)| **id != except)
+                    .filter(|(other, _)| **other != id)
                     .filter_map(|(_, h)| h.upgrade())
                     .collect();
                 (excess, all)
             };
             // A few more than needed: some may be busy.
             let want = (excess + 4).min(all.len());
-            if want == 0 {
-                return;
-            }
             let mut all: Vec<(u64, Arc<dyn CachedHandle>)> =
                 all.drain(..).map(|h| (h.last_used(), h)).collect();
             if want < all.len() {
@@ -154,19 +160,18 @@ impl OpenFiles {
             for (_, h) in all {
                 if h.try_close() {
                     closed += 1;
-                    if self.open_count() < self.max() {
-                        return;
+                    if closed >= excess {
+                        break;
                     }
                 }
             }
-            if closed == 0 {
-                // Every one of them is busy: over the budget for now.
-                return;
-            }
+            // Room is checked again under the lock; none closed: every one busy.
+            tried = closed == 0;
         }
     }
 
-    /// A handle was opened (after [`Self::make_room`]).
+    /// A handle that is open already is counted in (one moved from another state), without
+    /// making room.
     pub fn opened(&self, id: u64, handle: Weak<dyn CachedHandle>) {
         self.open.lock().insert(id, handle);
     }
@@ -216,10 +221,16 @@ impl Entry {
         self.last_used.load(Ordering::Relaxed)
     }
 
-    /// Room made for this handle, before it is opened.
-    pub fn make_room(&self) {
-        self.budget.make_room(self.id);
+    /// Counted in before this handle is opened, room made for it ([`OpenFiles::admit`]); if the
+    /// open fails, [`Self::closed`].
+    pub fn admit<T: CachedHandle + 'static>(&self, me: &Arc<T>) {
+        let weak: Weak<T> = Arc::downgrade(me);
+        let weak: Weak<dyn CachedHandle> = weak;
+        self.touch();
+        self.budget.admit(self.id, weak);
     }
+
+    /// Counted in, open already ([`OpenFiles::opened`]).
 
     pub fn opened<T: CachedHandle + 'static>(&self, me: &Arc<T>) {
         let weak: Weak<T> = Arc::downgrade(me);
@@ -285,9 +296,8 @@ mod tests {
 
     fn use_it(f: &Arc<Fake>) {
         if !*f.open.read() {
-            f.entry.make_room();
+            f.entry.admit(f);
             *f.open.write() = true;
-            f.entry.opened(f);
         }
         f.entry.touch();
     }

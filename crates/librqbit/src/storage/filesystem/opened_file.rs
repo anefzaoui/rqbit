@@ -452,7 +452,22 @@ impl OpenedFileLocked {
         if self.fd.take().is_some() {
             shared.entry.closed();
         }
-        shared.entry.make_room();
+        shared.entry.admit(shared);
+        match self.open(write) {
+            Ok(fd) => {
+                self.fd = Some(fd);
+                self.read_only = !write;
+                Ok(())
+            }
+            Err(e) => {
+                shared.entry.closed();
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::reopen`]'s open, counted in the budget already.
+    fn open(&mut self, write: bool) -> anyhow::Result<File> {
         let read_only = !write;
         let fd = if self.exists {
             open_existing(&self.path, read_only)?
@@ -483,10 +498,7 @@ impl OpenedFileLocked {
                 Err(e) => return Err(e).with_context(|| format!("error opening {:?}", self.path)),
             }
         };
-        self.fd = Some(fd);
-        self.read_only = read_only;
-        shared.entry.opened(shared);
-        Ok(())
+        Ok(fd)
     }
 }
 
