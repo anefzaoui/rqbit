@@ -161,7 +161,10 @@ impl TorrentStateLocked {
     }
 
     fn try_flush_bitv(&mut self, shared: &ManagedTorrentShared, flush_async: bool) {
-        if self.unflushed_bitv_bytes == 0 {
+        // A synchronous flush (pause, finish) goes on with nothing new too: what an earlier
+        // asynchronous one only queued is written by it (the bitfield skips a snapshot
+        // already on disk).
+        if self.unflushed_bitv_bytes == 0 && flush_async {
             return;
         }
         trace!("trying to flush bitfield");
