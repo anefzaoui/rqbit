@@ -27,6 +27,10 @@ use super::{
     fake_peer::{ClientOpts, Fixture, PIECE_LEN, SeederOpts, run, start_client, start_seeder},
     test_util::wait_until,
 };
+use crate::{
+    dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    stream_connect::{StreamConnector, StreamConnectorArgs},
+};
 
 /// The links to the peers, cut and restored together.
 struct Network {
@@ -231,6 +235,65 @@ async fn test_one_dial_per_dead_peer_per_network_change() -> anyhow::Result<()> 
         // The fresh backoff's one dial (10-20 s after the change), and no other.
         sleep(Duration::from_secs(23).saturating_sub(changed.elapsed())).await;
         assert_eq!(added(&dials(&links), &at_change), vec![2, 2, 2]);
+        Ok(())
+    })
+    .await
+}
+
+// A magnet's metadata lookup asks each peer once; one that failed while the network was gone
+// is asked again when the network changes, and not before.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metadata_peer_asked_again_when_the_network_comes_back() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder(SeederOpts::default()).await?;
+        let net = Network::new();
+        let link = net.link(seed.addr()).await?;
+        net.cut();
+
+        let (network, changes) = watch::channel(0u64);
+        // The DHT and trackers never end their stream.
+        let addrs = futures::StreamExt::chain(
+            futures::stream::iter([link.addr]),
+            futures::stream::pending(),
+        );
+        let connector = Arc::new(
+            StreamConnector::new(StreamConnectorArgs {
+                enable_tcp: true,
+                ipv4_only: true,
+                ..Default::default()
+            })
+            .await?,
+        );
+        let mut lookup = Box::pin(read_metainfo_from_peer_receiver(
+            crate::tests::test_util::TestPeerMetadata::good().as_peer_id(),
+            seed.info_hash,
+            Vec::new(),
+            addrs,
+            None,
+            connector,
+            crate::client_name_and_version().to_owned(),
+            None,
+            Some(changes),
+        ));
+
+        assert!(timeout(Duration::from_secs(2), &mut lookup).await.is_err());
+        assert_eq!(link.dials(), 1);
+        net.restore();
+        assert!(
+            timeout(Duration::from_secs(2), &mut lookup).await.is_err(),
+            "found without being told"
+        );
+        assert_eq!(link.dials(), 1, "asked again by itself");
+
+        network.send_modify(|n| *n += 1);
+        match timeout(Duration::from_secs(5), &mut lookup)
+            .await
+            .context("not found 5 s after the network came back")?
+        {
+            ReadMetainfoResult::Found { .. } => {}
+            ReadMetainfoResult::ChannelClosed { .. } => anyhow::bail!("lookup ended"),
+        }
+        assert_eq!(link.dials(), 2);
         Ok(())
     })
     .await

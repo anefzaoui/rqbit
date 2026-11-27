@@ -1984,6 +1984,7 @@ impl Session {
             self.connector.clone(),
             self.client_name_and_version.clone(),
             progress,
+            Some(self.network.subscribe()),
         )
         .await
         {
