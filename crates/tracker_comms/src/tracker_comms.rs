@@ -36,6 +36,60 @@ pub struct TrackerComms {
     announce_port: u16,
     reqwest_client: reqwest::Client,
     key: u32,
+    // Changes when the client saw the network come back (`TrackerComms::start`).
+    network: Option<NetworkChanges>,
+}
+
+/// A value that changes each time the client saw the network come back (a new local address,
+/// a wake from sleep, answers again after an outage): each tracker is then asked again at once
+/// rather than at its next turn, as its peers may be gone or moved. Only the change matters.
+pub type NetworkChanges = tokio::sync::watch::Receiver<u64>;
+
+/// After the network comes back, a tracker that answered is asked again no sooner than its
+/// `min interval` after that answer, or this when it gave none: a client seen announcing more
+/// often may be banned. An outage that needs this is longer than it in most cases, so the
+/// announce is at once.
+const REANNOUNCE_MIN_GAP: Duration = Duration::from_secs(60);
+
+/// Retries after an HTTP tracker failed: 10 s, doubling, up to 10 minutes (with jitter).
+fn http_retry_backoff() -> backon::ExponentialBackoff {
+    use backon::BackoffBuilder;
+    ExponentialBuilder::new()
+        .without_max_times()
+        .with_jitter()
+        .with_factor(2.)
+        .with_min_delay(Duration::from_secs(10))
+        .with_max_delay(Duration::from_secs(600))
+        .build()
+}
+
+/// Waits `wait`; a network change ends the wait early, though not before `not_before`.
+async fn wait_or_network_change(
+    wait: Duration,
+    not_before: Option<Duration>,
+    network: &mut Option<NetworkChanges>,
+) {
+    let start = tokio::time::Instant::now();
+    let deadline = start + wait;
+    let changed = async {
+        let changed = match network.as_mut() {
+            Some(rx) => rx.changed().await.is_ok(),
+            None => false,
+        };
+        // No watcher, or it is gone: only the wait ends it.
+        if !changed {
+            std::future::pending::<()>().await
+        }
+    };
+    tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => {}
+        _ = changed => {
+            let at = not_before.map_or(start, |gap| start + gap).min(deadline);
+            let left = at.saturating_duration_since(tokio::time::Instant::now());
+            debug!(?left, "network changed, announcing again");
+            tokio::time::sleep_until(at).await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -109,6 +163,14 @@ impl std::fmt::Debug for SupportedTracker {
 /// that answers 0 isn't asked again in a tight loop.
 fn http_announce_interval(interval: u64, min_interval: Option<u64>) -> Duration {
     Duration::from_secs(interval.max(min_interval.unwrap_or(0)).max(5))
+}
+
+/// How soon after an answer an HTTP tracker may be asked again when the network comes back:
+/// its `min interval`, or `REANNOUNCE_MIN_GAP` when it gave none; never under 5 seconds.
+fn http_reannounce_gap(min_interval: Option<u64>) -> Duration {
+    min_interval
+        .map_or(REANNOUNCE_MIN_GAP, Duration::from_secs)
+        .max(Duration::from_secs(5))
 }
 
 /// Drives one tracker monitor to its end and logs how it ended. A panic in the monitor ends only
@@ -201,6 +263,7 @@ async fn read_body_capped(mut response: reqwest::Response, max: usize) -> anyhow
 
 impl TrackerComms {
     // TODO: fix too many args
+    /// `network`: see [`NetworkChanges`]; None keeps each tracker to its own schedule.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         info_hash: Id20,
@@ -211,6 +274,7 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
+        network: Option<NetworkChanges>,
     ) -> Option<BoxStream<'static, SocketAddr>> {
         let trackers = trackers
             .into_iter()
@@ -243,6 +307,7 @@ impl TrackerComms {
                 announce_port,
                 reqwest_client,
                 key: rand::random(),
+                network,
             });
             // Each tracker is isolated behind `catch_unwind`: all trackers and
             // (upstream of this stream) DHT/LSD peers are polled from the same
@@ -302,33 +367,36 @@ impl TrackerComms {
     async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
         trace!(url=%tracker_url, "starting monitor");
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
+        let mut network = self.network.clone();
+        let mut retry = http_retry_backoff();
 
         loop {
-            let interval = (|| self.tracker_one_request_http(&tracker_url, event))
-                .retry(
-                    ExponentialBuilder::new()
-                        .without_max_times()
-                        .with_jitter()
-                        .with_factor(2.)
-                        .with_min_delay(Duration::from_secs(10))
-                        .with_max_delay(Duration::from_secs(600)),
-                )
-                .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
-                .await
-                .context("this shouldn't fail")?;
-
-            event = None;
-            let interval = self.force_tracker_interval.unwrap_or(interval);
-            debug!("sleeping for {:?} after calling tracker", interval);
-            tokio::time::sleep(interval).await;
+            match self.tracker_one_request_http(&tracker_url, event).await {
+                Ok((interval, reannounce_gap)) => {
+                    event = None;
+                    retry = http_retry_backoff();
+                    let interval = self.force_tracker_interval.unwrap_or(interval);
+                    debug!("sleeping for {:?} after calling tracker", interval);
+                    wait_or_network_change(interval, Some(reannounce_gap), &mut network).await;
+                }
+                Err(err) => {
+                    // The backoff has no end (without_max_times); its longest wait otherwise.
+                    let retry_in = retry.next().unwrap_or(Duration::from_secs(600));
+                    debug!(?retry_in, "error calling tracker: {err:#}");
+                    // It didn't answer: asked again at once when the network comes back.
+                    wait_or_network_change(retry_in, None, &mut network).await;
+                }
+            }
         }
     }
 
+    /// The wait until the next announce, and how soon after this one it may come when the
+    /// network comes back.
     async fn tracker_one_request_http(
         &self,
         tracker_url: &Url,
         event: Option<tracker_comms_http::TrackerRequestEvent>,
-    ) -> anyhow::Result<Duration> {
+    ) -> anyhow::Result<(Duration, Duration)> {
         let stats = self.stats.get();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
@@ -377,9 +445,9 @@ impl TrackerComms {
         for peer in response.iter_peers() {
             self.tx.send(peer).await?;
         }
-        Ok(http_announce_interval(
-            response.interval,
-            response.min_interval,
+        Ok((
+            http_announce_interval(response.interval, response.min_interval),
+            http_reannounce_gap(response.min_interval),
         ))
     }
 
@@ -397,11 +465,16 @@ impl TrackerComms {
         );
 
         let mut sleep_interval: Option<Duration> = None;
+        // Whether the last announce was answered: then a network change waits
+        // REANNOUNCE_MIN_GAP after it (UDP trackers give no `min interval`).
+        let mut answered = false;
+        let mut network = self.network.clone();
         let mut prev_addrs: Option<UdpTrackerResolveResult> = None;
         loop {
             if let Some(i) = sleep_interval {
                 trace!(interval=?sleep_interval, "sleeping");
-                tokio::time::sleep(i).await;
+                let gap = answered.then_some(REANNOUNCE_MIN_GAP);
+                wait_or_network_change(i, gap, &mut network).await;
             }
 
             // This should retry forever until the addrs are resolved.
@@ -430,8 +503,12 @@ impl TrackerComms {
                         .instrument(trace_span!("udp request", ?addr))
                         .await
                     {
-                        Ok(sleep) => sleep_interval = Some(sleep),
+                        Ok(sleep) => {
+                            answered = true;
+                            sleep_interval = Some(sleep)
+                        }
                         Err(_) => {
+                            answered = false;
                             sleep_interval = Some(sleep_interval.unwrap_or(Duration::from_secs(60)))
                         }
                     }
@@ -443,12 +520,9 @@ impl TrackerComms {
                         self.tracker_one_request_udp(v6.into(), &client)
                             .instrument(trace_span!("udp request", addr=?v6))
                     );
-                    sleep_interval = Some(
-                        r4.or(r6)
-                            .ok()
-                            .or(sleep_interval)
-                            .unwrap_or(Duration::from_secs(60)),
-                    )
+                    let r = r4.or(r6).ok();
+                    answered = r.is_some();
+                    sleep_interval = Some(r.or(sleep_interval).unwrap_or(Duration::from_secs(60)))
                 }
             }
         }
@@ -630,6 +704,136 @@ mod tests {
             "every monitor ends, none of them unwinds into the poller"
         );
         assert_eq!(finished.load(Ordering::SeqCst), 2);
+    }
+
+    /// An HTTP tracker on loopback: answers request n (from 0) with `answer(n)` (a status and a
+    /// body) and sends each request's time on the channel.
+    async fn counting_tracker(
+        answer: impl Fn(usize) -> (u16, Vec<u8>) + Send + Sync + 'static,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<tokio::time::Instant>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut n = 0;
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut req = [0u8; 2048];
+                let _ = s.read(&mut req).await;
+                let _ = tx.send(tokio::time::Instant::now());
+                let (status, body) = answer(n);
+                n += 1;
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(&body).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/announce"), rx)
+    }
+
+    /// One HTTP tracker's monitor, with `network` for its network changes. The peers it
+    /// receives are dropped.
+    fn monitor_http(url: &str, network: super::NetworkChanges) {
+        let (tx, mut peers) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move { while peers.recv().await.is_some() {} });
+        let comms = Arc::new(super::TrackerComms {
+            info_hash: Default::default(),
+            peer_id: Default::default(),
+            stats: Box::new(()),
+            force_tracker_interval: None,
+            tx,
+            announce_port: 6881,
+            reqwest_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            key: 1,
+            network: Some(network),
+        });
+        let url = Url::parse(url).unwrap();
+        tokio::spawn(async move { comms.task_single_tracker_monitor_http(url).await });
+    }
+
+    /// Whether a request comes within `secs` seconds.
+    async fn asked_within(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<tokio::time::Instant>,
+        secs: f64,
+    ) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs_f64(secs), rx.recv())
+            .await
+            .is_ok()
+    }
+
+    // When the network comes back, a tracker that answered (here 30 minutes to the next
+    // announce) is asked again at once, once its `min interval` has passed; and only once per
+    // change. With a `min interval` longer than the outage, not before it.
+    #[tokio::test]
+    async fn test_http_tracker_asked_again_when_the_network_comes_back() {
+        for (min_interval, asked_again) in [(1, true), (3600, false)] {
+            let body = format!("d8:intervali1800e12:min intervali{min_interval}e5:peers0:e");
+            let (url, mut asked) =
+                counting_tracker(move |_| (200, body.clone().into_bytes())).await;
+            let (network, rx) = tokio::sync::watch::channel(0u64);
+            monitor_http(&url, rx);
+            assert!(asked_within(&mut asked, 5.).await, "the first announce");
+            // Its own schedule: nothing for 30 minutes. (Past the 5 s floor of a 1 s min
+            // interval, so the change below is answered at once.)
+            assert!(
+                !asked_within(&mut asked, 5.).await,
+                "asked again unprompted"
+            );
+
+            network.send_modify(|n| *n += 1);
+            assert_eq!(
+                asked_within(&mut asked, 2.).await,
+                asked_again,
+                "min interval {min_interval}"
+            );
+            assert!(
+                !asked_within(&mut asked, 2.).await,
+                "asked twice for one change"
+            );
+        }
+    }
+
+    // A tracker that failed waits 10-20 s for its next try; when the network comes back it is
+    // asked at once.
+    #[tokio::test]
+    async fn test_failed_http_tracker_retried_when_the_network_comes_back() {
+        let (url, mut asked) = counting_tracker(|n| match n {
+            0 => (503, b"down".to_vec()),
+            _ => (200, b"d8:intervali1800e5:peers0:e".to_vec()),
+        })
+        .await;
+        let (network, rx) = tokio::sync::watch::channel(0u64);
+        monitor_http(&url, rx);
+        assert!(asked_within(&mut asked, 5.).await, "the first announce");
+        assert!(
+            !asked_within(&mut asked, 2.).await,
+            "retried before its backoff"
+        );
+        network.send_modify(|n| *n += 1);
+        assert!(asked_within(&mut asked, 2.).await, "not retried at once");
+        assert!(
+            !asked_within(&mut asked, 3.).await,
+            "asked twice for one change"
+        );
+    }
+
+    #[test]
+    fn test_http_reannounce_gap() {
+        use std::time::Duration;
+        assert_eq!(
+            super::http_reannounce_gap(Some(900)),
+            Duration::from_secs(900)
+        );
+        assert_eq!(super::http_reannounce_gap(None), super::REANNOUNCE_MIN_GAP);
+        assert_eq!(super::http_reannounce_gap(Some(0)), Duration::from_secs(5));
     }
 
     #[test]

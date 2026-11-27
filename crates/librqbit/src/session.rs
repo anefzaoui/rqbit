@@ -152,6 +152,9 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
+
+    // Bumped when the network came back: the trackers watch it.
+    network: tokio::sync::watch::Sender<u64>,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -952,6 +955,7 @@ impl Session {
                 blocklist,
                 allowlist,
                 lsd,
+                network: tokio::sync::watch::Sender::new(0),
             });
 
             if let Some(mut listen) = listen_result {
@@ -1814,6 +1818,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            Some(self.network.subscribe()),
         );
         let tracker_rx = counted(filtered(tracker_rx), |p| &p.from_trackers);
 
