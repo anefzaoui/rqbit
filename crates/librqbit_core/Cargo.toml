@@ -33,7 +33,6 @@ directories.workspace = true
 tokio-util.workspace = true
 data-encoding.workspace = true
 bytes.workspace = true
-memchr.workspace = true
 thiserror.workspace = true
 chardetng.workspace = true
 encoding_rs.workspace = true

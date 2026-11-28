@@ -176,13 +176,18 @@ where
 
     /// Iterate path components as strings. Will decode using UTF-8 if valid, or fall back to
     /// the detected encoding, replacing unknown characters with a placeholder.
+    ///
+    /// Each component is made a plain name for this system ([`sanitize_component`]): a torrent
+    /// whose names a disk can't hold as they are is downloaded under names it can, not refused.
     pub fn iter_components(&self) -> impl Iterator<Item = Cow<'a, str>> + use<'a, BufType> {
         let encoding = self.encoding;
-        self.iter_components_bytes()
-            .map(move |part| match std::str::from_utf8(part) {
+        self.iter_components_bytes().map(move |part| {
+            let decoded = match std::str::from_utf8(part) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => encoding.decode(part).0,
-            })
+            };
+            sanitize_component(decoded)
+        })
     }
 
     /// Iterate path components as bytes.
@@ -196,6 +201,103 @@ where
         };
         Either::Right(it)
     }
+}
+
+/// The longest name a disk takes: 255 bytes on Linux and macOS, 255 UTF-16 units on Windows. Only
+/// a longer one is cut, so a name a disk took before keeps it (its downloads keep their files).
+const MAX_NAME: usize = 255;
+
+/// One component of a torrent's path (a folder or a file name) as a plain name for this system;
+/// one that already is comes back as it is. See [`sanitize_component_for`].
+pub fn sanitize_component(part: Cow<'_, str>) -> Cow<'_, str> {
+    sanitize_component_for(part, cfg!(windows))
+}
+
+/// [`sanitize_component`] with Windows' rules (`windows`) or Linux's and macOS's, so the tests can
+/// try both anywhere. Only names a disk couldn't hold as they are change, so a torrent downloaded
+/// before keeps its names:
+/// - everywhere: `/` and `\` inside the name (a path written as one element) and control
+///   characters become `_`; an empty name or `.` becomes `_`, and so does one that would be `.`
+///   or `..` once Windows' rules are applied (an element that is `..` itself is refused before, as
+///   a path traversal); a name longer than a disk takes is cut on a character boundary, keeping
+///   an extension of up to 9 bytes;
+/// - on Windows: `< > : " | ? *` become `_`, trailing dots and spaces go (Windows drops them, so
+///   two names would be one), and a device name (`CON`, `nul.txt`, `COM1`, `LPT¹`...) gets a `_`
+///   in front.
+///
+/// Unicode is never normalized and nothing else changes: full-width look-alikes, emoji and
+/// right-to-left text are names like any other.
+pub fn sanitize_component_for(part: Cow<'_, str>, windows: bool) -> Cow<'_, str> {
+    let bad =
+        |c: char| c == '/' || c == '\\' || c.is_control() || (windows && r#"<>:"|?*"#.contains(c));
+    let mut out: Cow<'_, str> = if part.chars().any(bad) {
+        Cow::Owned(part.chars().map(|c| if bad(c) { '_' } else { c }).collect())
+    } else {
+        part
+    };
+    if windows {
+        let kept = out.trim_end_matches(['.', ' ']).len();
+        if kept != out.len() {
+            out = Cow::Owned(out[..kept].to_owned());
+        }
+        if is_windows_device(&out) {
+            out = Cow::Owned(format!("_{out}"));
+        }
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        return Cow::Owned("_".to_owned());
+    }
+    let measure = |s: &str| {
+        if windows {
+            s.encode_utf16().count()
+        } else {
+            s.len()
+        }
+    };
+    if measure(&out) > MAX_NAME {
+        out = Cow::Owned(cut_name(&out, measure));
+    }
+    out
+}
+
+/// A Windows device name, with or without an extension (`NUL.txt`, `com1.tar.gz`, `CON .txt`;
+/// superscript digits count too): the part before the first dot, its trailing spaces left out.
+fn is_windows_device(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.chars().count() == 4
+        && stem
+            .chars()
+            .nth(3)
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')))
+}
+
+/// `name` cut to [`MAX_NAME`] (as `measure` counts) on a character boundary, keeping its
+/// extension (the part after the last dot, up to 9 bytes) when it has one.
+fn cut_name(name: &str, measure: impl Fn(&str) -> usize) -> String {
+    let ext = name
+        .rfind('.')
+        .filter(|&dot| dot > 0 && name.len() - dot - 1 <= 9)
+        .map_or("", |dot| &name[dot..]);
+    let stem = &name[..name.len() - ext.len()];
+    let room = MAX_NAME.saturating_sub(measure(ext));
+    let mut end = 0;
+    for (i, c) in stem.char_indices() {
+        let next = i + c.len_utf8();
+        if measure(&stem[..next]) > room {
+            break;
+        }
+        end = next;
+    }
+    format!("{}{ext}", &stem[..end])
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, Copy)]
@@ -338,10 +440,9 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
                 if bit == b".." {
                     return Err(Error::BadTorrentPathTraversal);
                 }
-                use memchr::memchr;
-                if memchr(b'/', bit).is_some() || memchr(b'\\', bit).is_some() {
-                    return Err(Error::BadTorrentSeparatorInName);
-                }
+                // A separator inside one name (a path a tool wrote as one element, as Windows
+                // tools do: `Folder\\file.ext`) is made `_` by `sanitize_component`, never a
+                // folder: the torrent is downloaded, not refused.
             }
             if !seen_a_bit {
                 return Err(Error::BadTorrentFileNoName);
@@ -564,6 +665,189 @@ mod tests {
 
     const TORRENT_BYTES: &[u8] =
         include_bytes!("../../librqbit/resources/ubuntu-21.04-desktop-amd64.iso.torrent");
+
+    fn san(part: &str, windows: bool) -> String {
+        sanitize_component_for(Cow::Borrowed(part), windows).into_owned()
+    }
+
+    /// The names of a study of real torrents and of five clients (#2077 in MDM): each input
+    /// component with the name expected on Windows and on Linux and macOS.
+    #[test]
+    fn components_are_made_plain_names() {
+        let cases: &[(&str, &str, &str)] = &[
+            // Separators inside one element, everywhere.
+            ("Folder\\file.ext", "Folder_file.ext", "Folder_file.ext"),
+            ("a/b", "a_b", "a_b"),
+            (
+                "Season 1\\Ep 01.mkv",
+                "Season 1_Ep 01.mkv",
+                "Season 1_Ep 01.mkv",
+            ),
+            ("sub\\deeper", "sub_deeper", "sub_deeper"),
+            // Windows drops the trailing dots of `ok_..` itself: they go.
+            ("ok/..", "ok_", "ok_.."),
+            // Dots.
+            (".", "_", "_"),
+            ("a..b", "a..b", "a..b"),
+            ("...x", "...x", "...x"),
+            ("...", "_", "..."),
+            ("", "_", "_"),
+            // Windows' reserved characters.
+            (
+                "What? Why: this | that*.txt",
+                "What_ Why_ this _ that_.txt",
+                "What? Why: this | that*.txt",
+            ),
+            (
+                "<tag>\"quoted\".mkv",
+                "_tag__quoted_.mkv",
+                "<tag>\"quoted\".mkv",
+            ),
+            (
+                "Ookami to Koushinryou: Merchant Meets the Wise Wolf (2024)",
+                "Ookami to Koushinryou_ Merchant Meets the Wise Wolf (2024)",
+                "Ookami to Koushinryou: Merchant Meets the Wise Wolf (2024)",
+            ),
+            // Trailing dots and spaces on Windows; a leading space is a name Windows takes.
+            ("file.", "file", "file."),
+            ("file ", "file", "file "),
+            (" lead.txt", " lead.txt", " lead.txt"),
+            ("name. .", "name", "name. ."),
+            (".. ", "_", ".. "),
+            // Device names on Windows.
+            ("CON", "_CON", "CON"),
+            ("con.txt", "_con.txt", "con.txt"),
+            ("Nul.tar.gz", "_Nul.tar.gz", "Nul.tar.gz"),
+            ("AUX.", "_AUX", "AUX."),
+            ("COM1", "_COM1", "COM1"),
+            ("lpt9.log", "_lpt9.log", "lpt9.log"),
+            ("COM¹.txt", "_COM¹.txt", "COM¹.txt"),
+            ("CONSOLE.txt", "CONSOLE.txt", "CONSOLE.txt"),
+            ("COM10", "COM10", "COM10"),
+            ("Conan", "Conan", "Conan"),
+            // Control characters, everywhere.
+            ("tab\tx", "tab_x", "tab_x"),
+            ("a\0b", "a_b", "a_b"),
+            ("\u{7f}", "_", "_"),
+            // Left as they are: full-width look-alikes, zero-width and bidi characters, emoji,
+            // right-to-left text, other scripts, both Unicode forms.
+            (
+                "ＡＢ／ＣＤ：？.txt",
+                "ＡＢ／ＣＤ：？.txt",
+                "ＡＢ／ＣＤ：？.txt",
+            ),
+            ("a\u{200b}b", "a\u{200b}b", "a\u{200b}b"),
+            (
+                "invoice\u{202e}gpj.exe",
+                "invoice\u{202e}gpj.exe",
+                "invoice\u{202e}gpj.exe",
+            ),
+            ("👨‍👩‍👧 trip 🎉.mp4", "👨‍👩‍👧 trip 🎉.mp4", "👨‍👩‍👧 trip 🎉.mp4"),
+            (
+                "اجمل نغمة منبه mp3.mp3",
+                "اجمل نغمة منبه mp3.mp3",
+                "اجمل نغمة منبه mp3.mp3",
+            ),
+            ("コホモロジー.pdf", "コホモロジー.pdf", "コホモロジー.pdf"),
+            ("e\u{301}", "e\u{301}", "e\u{301}"),
+        ];
+        for (input, win, nix) in cases {
+            assert_eq!(san(input, true), *win, "Windows: {input:?}");
+            assert_eq!(san(input, false), *nix, "Linux/macOS: {input:?}");
+        }
+    }
+
+    /// A name a disk doesn't take is cut to 255 bytes (Linux, macOS) or UTF-16 units (Windows) on a
+    /// character boundary, its extension kept; a name it takes is left whole.
+    #[test]
+    fn long_names_are_cut_to_what_a_disk_takes() {
+        let long = format!("{}.mkv", "a".repeat(300));
+        let want = format!("{}.mkv", "a".repeat(251));
+        assert_eq!(san(&long, true), want);
+        assert_eq!(san(&long, false), want);
+
+        // 100 Hangul syllables: 104 UTF-16 units (Windows takes them), 304 bytes (cut elsewhere).
+        let hangul = format!("{}.pdf", "한".repeat(100));
+        assert_eq!(san(&hangul, true), hangul);
+        let cut = san(&hangul, false);
+        assert_eq!(cut, format!("{}.pdf", "한".repeat(83)));
+        assert!(cut.len() <= 255);
+
+        let fits = "b".repeat(255);
+        assert_eq!(san(&fits, false), fits, "255 bytes fit");
+        // No extension to keep: a long last part after the dot is cut too.
+        let odd = format!("x.{}", "y".repeat(300));
+        assert_eq!(san(&odd, false).len(), 255);
+    }
+
+    /// A name that is already plain comes back borrowed, as it was.
+    #[test]
+    fn plain_names_are_not_copied() {
+        for name in ["readme.txt", "Big Buck Bunny", "файл.txt"] {
+            assert!(matches!(
+                sanitize_component_for(Cow::Borrowed(name), true),
+                Cow::Borrowed(_)
+            ));
+        }
+    }
+
+    fn info(files: &[(&[&[u8]], u64)]) -> TorrentMetaV1Info<ByteBufOwned> {
+        let total: u64 = files.iter().map(|(_, l)| *l).sum();
+        let pieces = total.div_ceil(16384) as usize;
+        TorrentMetaV1Info {
+            name: Some(ByteBufOwned::from(&b"set"[..])),
+            pieces: ByteBufOwned::from(vec![0u8; pieces * 20]),
+            piece_length: 16384,
+            files: Some(
+                files
+                    .iter()
+                    .map(|(path, length)| TorrentMetaV1File {
+                        length: *length,
+                        path: path.iter().map(|p| ByteBufOwned::from(*p)).collect(),
+                        path_utf8: None,
+                        attr: None,
+                        sha1: None,
+                        symlink_path: None,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// #2077: a separator inside one element no longer refuses the torrent; its files get plain
+    /// names, and `..` is still refused.
+    #[test]
+    fn separators_in_a_name_are_downloaded_under_plain_names() {
+        let v = info(&[(&[b"a\\b.mkv"], 10), (&[b"dir", b"x/y", b"f.bin"], 20)])
+            .validate()
+            .expect("not refused");
+        let names: Vec<PathBuf> = v
+            .iter_file_details()
+            .map(|f| f.filename.to_pathbuf())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                PathBuf::from("a_b.mkv"),
+                ["dir", "x_y", "f.bin"].iter().collect::<PathBuf>(),
+            ]
+        );
+        assert!(matches!(
+            info(&[(&[b"dir", b"..", b"f"], 1)]).validate(),
+            Err(Error::BadTorrentPathTraversal)
+        ));
+    }
+
+    /// Two names that become one once made plain (`a/b` and `a_b`) are still two files in one
+    /// place: refused, as two equal names are.
+    #[test]
+    fn names_that_become_equal_are_refused_as_duplicates() {
+        assert!(matches!(
+            info(&[(&[b"a/b"], 1), (&[b"a_b"], 1)]).validate(),
+            Err(Error::BadTorrentDuplicateFilenames)
+        ));
+    }
 
     #[test]
     fn test_deserialize_torrent_borrowed() {
